@@ -93,9 +93,12 @@ fi
 # 如果安装脚本在本地被直接调用执行，同步当前脚本与模版文件
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "$CURRENT_DIR" != "$INSTALL_DIR" ] && [ -f "$CURRENT_DIR/aiproxy.sh" ]; then
-    echo -e "${CYAN}[INFO] 同步本地开发文件至 ${INSTALL_DIR}...${RESET}"
-    cp -rf "$CURRENT_DIR"/* "$INSTALL_DIR"/ 2>/dev/null || true
-    cp -rf "$CURRENT_DIR"/.* "$INSTALL_DIR"/ 2>/dev/null || true
+    echo -e "${CYAN}[INFO] 同步本地文件至 ${INSTALL_DIR}...${RESET}"
+    shopt -s dotglob nullglob 2>/dev/null || true
+    for item in "$CURRENT_DIR"/*; do
+        [ -e "$item" ] && cp -rf "$item" "$INSTALL_DIR"/ 2>/dev/null || true
+    done
+    shopt -u dotglob nullglob 2>/dev/null || true
 fi
 
 # 5. 配置快捷命令与初始化权限
@@ -103,11 +106,9 @@ echo -e "${CYAN}[4/5] 正在配置执行权限与全局软链接 /usr/local/bin/
 chmod +x "$INSTALL_DIR/aiproxy.sh"
 ln -sf "$INSTALL_DIR/aiproxy.sh" /usr/local/bin/aiproxy
 
-# 执行一次初始化生成配置
+# 执行一次初始化生成配置与 Compose 编排
 cd "$INSTALL_DIR"
-if [ ! -f "$INSTALL_DIR/.env" ]; then
-    bash "$INSTALL_DIR/aiproxy.sh" help >/dev/null 2>&1 || true
-fi
+bash "$INSTALL_DIR/aiproxy.sh" init >/dev/null 2>&1 || true
 
 echo -e "${CYAN}[5/5] 安装校验完成！${RESET}"
 echo -e "${GREEN}======================================================================${RESET}"

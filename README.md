@@ -113,6 +113,7 @@ aiproxy
 | 命令 | 说明 |
 | :--- | :--- |
 | `aiproxy` 或 `aiproxy menu` | 唤起彩色交互式 TUI 主菜单 |
+| `aiproxy init` | 初始化项目配置模版并动态生成 Compose 编排 |
 | `aiproxy status` | 快速输出当前各组件状态与系统资源占用 |
 | `aiproxy start [服务名]` | 启动全部（或指定如 `grok2api`）容器 |
 | `aiproxy stop [服务名]` | 停止全部（或指定）容器 |
@@ -122,6 +123,19 @@ aiproxy
 | `aiproxy update` | 一键拉取最新镜像并平滑重建已启用容器 |
 | `aiproxy backup` | 快速将配置文件、凭据与数据库打包为 `.tar.gz` |
 | `aiproxy help` | 输出命令行参数使用帮助 |
+
+---
+
+## 🔑 核心组件默认凭据一览
+
+首次部署启动后，各组件初始凭据如下（建议生产环境及时修改）：
+
+| 服务组件 | 访问入口 | 默认账号 / 密钥 | 配置文件路径 |
+| :--- | :--- | :--- | :--- |
+| **NewAPI** | `http://IP:3000` | 初始管理员: `root` / 初始密码: `123456` | `data/newapi/api.db` |
+| **Grok2API** | `http://IP:8000` | `admin` / `grok2api_default_password` (自动生成 32 字节 AES 密钥) | `data/grok2api/config.yaml` |
+| **CLIProxyAPI** | `http://IP:8317` | 调用 Key: `sk-cliproxy-default-key`<br>管理后台 Key: `aiproxy-cliproxy-admin` | `data/cliproxy/config.yaml` |
+| **WorkBuddy2API** | `http://IP:7863` | 调用 Key: `sk-workbuddy-default-key` | `data/workbuddy/config.json` |
 
 ---
 

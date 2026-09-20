@@ -207,9 +207,103 @@ else
 fi
 echo "✓ Test 9 通过"
 
+# Test 10: Verify Grok2API 32-byte AES key and JWT hex lengths
+echo "[Test 10] 深度校验 Grok2API 32 字节 AES 密钥与 JWT 密钥长度..."
+(
+    cd test_env
+    source aiproxy.sh
+    hex_key=$(generate_random_hex 32)
+    b64_key=$(generate_random_base64 32)
+    echo "  Hex Key: $hex_key (长度: ${#hex_key})"
+    echo "  Base64 Key: $b64_key (长度: ${#b64_key})"
+
+    if [ "${#hex_key}" -eq 64 ] && [ "${#b64_key}" -eq 44 ]; then
+        echo "✓ 密钥字节数与字符长度完全符合 256 位安全标准 (Hex 64字符 / Base64 44字符)"
+    else
+        echo "✗ 密钥长度不符合 32 字节标准: hex=${#hex_key}, b64=${#b64_key}"
+        exit 1
+    fi
+
+    # Verify python can decode base64 into exactly 32 raw bytes (AES-256 requirement)
+    python -c "
+import base64
+raw = base64.b64decode('$b64_key')
+assert len(raw) == 32, f'Decoded bytes length is {len(raw)}, expected 32'
+print('[OK] AES-256 32-byte key decodable')
+"
+)
+echo "✓ Test 10 通过"
+
+# Test 11: Test Port validation logic
+echo "[Test 11] 测试端口校验与防冲突逻辑..."
+(
+    cd test_env
+    source aiproxy.sh
+    is_valid_port 80 && is_valid_port 65535 || { echo "✗ 有效端口被误判"; exit 1; }
+    ! is_valid_port 0 && ! is_valid_port 65536 && ! is_valid_port "abc" || { echo "✗ 无效端口未被拦截"; exit 1; }
+    echo "✓ 端口格式校验规则符合预期"
+)
+echo "✓ Test 11 通过"
+
+# Test 12: Test pure toggle_service_list staging memory logic
+echo "[Test 12] 测试纯内存组件切换逻辑 (toggle_service_list)..."
+(
+    cd test_env
+    source aiproxy.sh
+    initial="newapi,grok2api"
+    res1=$(toggle_service_list "cliproxy" "$initial")
+    if [ "$res1" = "newapi,grok2api,cliproxy" ]; then
+        echo "✓ 纯内存加装组件成功: $res1"
+    else
+        echo "✗ 加装组件失败: $res1"
+        exit 1
+    fi
+
+    res2=$(toggle_service_list "newapi" "$res1")
+    if [ "$res2" = "grok2api,cliproxy" ]; then
+        echo "✓ 纯内存卸载组件成功: $res2"
+    else
+        echo "✗ 卸载组件失败: $res2"
+        exit 1
+    fi
+)
+echo "✓ Test 12 通过"
+
+# Test 13: Test CLI init and ensure_initialized
+echo "[Test 13] 测试 CLI init 与 ensure_initialized 自动就绪..."
+(
+    rm -rf test_env_init
+    mkdir -p test_env_init/templates
+    cp templates/* test_env_init/templates/
+    cp aiproxy.sh test_env_init/
+    cd test_env_init
+    bash aiproxy.sh init
+    if [ -f ".env" ] && [ -f "docker-compose.yml" ] && [ -f "data/grok2api/config.yaml" ]; then
+        echo "✓ aiproxy init 成功初始化全部环境配置与 Compose 编排"
+    else
+        echo "✗ aiproxy init 初始化失败"
+        exit 1
+    fi
+    cd ..
+    rm -rf test_env_init
+)
+echo "✓ Test 13 通过"
+
+# Test 14: Check LF line endings on all repository shell scripts
+echo "[Test 14] 校验所有 Shell 脚本 LF 换行符合规性..."
+for f in aiproxy.sh install.sh test_aiproxy.sh; do
+    if grep -q $'\r' "$f"; then
+        echo "✗ 文件 $f 包含 Windows CRLF 换行符！"
+        exit 1
+    else
+        echo "✓ $f 换行符为纯 LF (UNIX)"
+    fi
+done
+echo "✓ Test 14 通过"
+
 # Clean test_env
 rm -rf test_env
 
 echo "=========================================="
-echo "🎉 全部 9 项自动化测试（含 PyYAML 结构级校验）全部通过！"
+echo "🎉 全部 14 项自动化深度测试（含 PyYAML 结构与密码学字节级校验）全部通过！"
 echo "=========================================="

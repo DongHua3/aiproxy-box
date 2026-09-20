@@ -147,10 +147,20 @@ get_swap_info() {
     echo "${total_mb:-0} ${free_mb:-0}"
 }
 
+CACHED_HOST_IP=""
+
 get_host_ip() {
+    if [ -n "$CACHED_HOST_IP" ]; then
+        echo "$CACHED_HOST_IP"
+        return
+    fi
     local ip
-    ip=$(curl -s -m 2 https://api.ipify.org 2>/dev/null || curl -s -m 2 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
-    echo "${ip:-127.0.0.1}"
+    ip=$(curl -s -m 1 https://ip.sb 2>/dev/null || \
+         curl -s -m 1 https://icanhazip.com 2>/dev/null || \
+         curl -s -m 1 https://api.ipify.org 2>/dev/null || \
+         hostname -I 2>/dev/null | awk '{print $1}')
+    CACHED_HOST_IP="${ip:-127.0.0.1}"
+    echo "$CACHED_HOST_IP"
 }
 
 # ------------------------------------------------------------------------------
@@ -211,27 +221,32 @@ EOF
 
 is_service_enabled() {
     local svc="$1"
-    [[ ",${ENABLED_SERVICES}," =~ ,${svc}, ]]
+    local list="${2:-$ENABLED_SERVICES}"
+    [[ ",${list}," =~ ,${svc}, ]]
 }
 
 # ------------------------------------------------------------------------------
 # 凭据随机生成与模版同步
 # ------------------------------------------------------------------------------
 generate_random_hex() {
-    local len="${1:-32}"
+    local num_bytes="${1:-32}"
     if command -v openssl >/dev/null 2>&1; then
-        openssl rand -hex "$len" 2>/dev/null | head -c "$len"
+        openssl rand -hex "$num_bytes" 2>/dev/null | tr -d '\r\n'
+    elif [ -c /dev/urandom ]; then
+        head -c "$num_bytes" /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \r\n' || head -c "$((num_bytes * 2))" /dev/urandom | tr -dc 'a-f0-9'
     else
-        head -c 64 /dev/urandom 2>/dev/null | tr -dc 'a-f0-9' | head -c "$len"
+        date +%s%N | sha256sum | awk '{print $1}' | head -c "$((num_bytes * 2))"
     fi
 }
 
 generate_random_base64() {
-    local len="${1:-32}"
+    local num_bytes="${1:-32}"
     if command -v openssl >/dev/null 2>&1; then
-        openssl rand -base64 "$len" 2>/dev/null | head -c "$len"
+        openssl rand -base64 "$num_bytes" 2>/dev/null | tr -d '\r\n'
+    elif [ -c /dev/urandom ]; then
+        head -c "$num_bytes" /dev/urandom 2>/dev/null | base64 | tr -d '\r\n'
     else
-        head -c 64 /dev/urandom 2>/dev/null | base64 | tr -dc 'a-zA-Z0-9' | head -c "$len"
+        date +%s%N | base64 | tr -d '\r\n' | head -c 44
     fi
 }
 
@@ -244,7 +259,7 @@ init_service_configs() {
 
     # 1. Grok2API 初始配置
     if [ ! -f "$DATA_DIR/grok2api/config.yaml" ] && [ -f "$TEMPLATES_DIR/grok2api.yaml" ]; then
-        info "初始化 Grok2API 默认配置文件并注入随机加密密钥..."
+        info "初始化 Grok2API 默认配置文件并注入随机加密密钥 (AES-256 / 32字节)..."
         local jwt_secret enc_key
         jwt_secret=$(generate_random_hex 32)
         enc_key=$(generate_random_base64 32)
@@ -265,12 +280,20 @@ init_service_configs() {
         cp "$TEMPLATES_DIR/workbuddy.json" "$DATA_DIR/workbuddy/config.json"
     fi
 
+    # 设置目录权限，防止 umask 导致容器内部权限拒绝
+    chmod 755 "$DATA_DIR/newapi" 2>/dev/null || true
+    chmod 755 "$DATA_DIR/grok2api" "$DATA_DIR/grok2api/data" 2>/dev/null || true
+    [ -f "$DATA_DIR/grok2api/config.yaml" ] && chmod 644 "$DATA_DIR/grok2api/config.yaml" 2>/dev/null || true
+    [ -f "$DATA_DIR/cliproxy/config.yaml" ] && chmod 644 "$DATA_DIR/cliproxy/config.yaml" 2>/dev/null || true
+
     # 修复 WorkBuddy2API 的 uid 10001 读写权限问题 (跨 uid 部署经典踩坑点)
     if [ -d "$DATA_DIR/workbuddy" ]; then
+        chmod 755 "$DATA_DIR/workbuddy" 2>/dev/null || true
+        [ -f "$DATA_DIR/workbuddy/config.json" ] && chmod 644 "$DATA_DIR/workbuddy/config.json" 2>/dev/null || true
         if [ "$(id -u)" -eq 0 ]; then
-            chown -R 10001:10001 "$DATA_DIR/workbuddy/auths" "$DATA_DIR/workbuddy/data" 2>/dev/null || true
-            chmod -R 775 "$DATA_DIR/workbuddy/auths" "$DATA_DIR/workbuddy/data" 2>/dev/null || true
+            chown -R 10001:10001 "$DATA_DIR/workbuddy" 2>/dev/null || true
         fi
+        chmod -R 777 "$DATA_DIR/workbuddy/auths" "$DATA_DIR/workbuddy/data" 2>/dev/null || true
     fi
 }
 
@@ -278,8 +301,15 @@ init_service_configs() {
 # 动态 Compose 组装引擎
 # ------------------------------------------------------------------------------
 generate_compose() {
-    load_env
+    if [ -z "$ENABLED_SERVICES" ]; then
+        load_env
+    fi
     init_service_configs
+
+    if [ -z "$ENABLED_SERVICES" ]; then
+        warn "未启用任何核心服务，无法生成有效 Compose 文件！"
+        return 1
+    fi
 
     # 读取内存信息，决定是否注入 OOM 防护限额
     read -r ram_total ram_free <<< "$(get_ram_info)"
@@ -438,6 +468,17 @@ EOF
     success "Compose 文件已成功构建！"
 }
 
+ensure_initialized() {
+    load_env
+    if [ ! -f "$ENV_FILE" ]; then
+        save_env
+    fi
+    init_service_configs
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        generate_compose
+    fi
+}
+
 # ------------------------------------------------------------------------------
 # 状态探测与彩色看板渲染
 # ------------------------------------------------------------------------------
@@ -567,7 +608,7 @@ menu_service_control() {
                 echo -e "可选容器: new-api, grok2api, cli-proxy-api, workbuddy2api"
                 read -r -p "请输入要启动的容器名称: " cname
                 if [ -n "$cname" ]; then
-                    docker start "$cname" && success "$cname 已启动" || error "启动失败"
+                    (docker start "$cname" 2>/dev/null || compose up -d "$cname") && success "$cname 已启动" || error "启动失败"
                 fi
                 pause
                 ;;
@@ -575,7 +616,7 @@ menu_service_control() {
                 echo -e "可选容器: new-api, grok2api, cli-proxy-api, workbuddy2api"
                 read -r -p "请输入要重启的容器名称: " cname
                 if [ -n "$cname" ]; then
-                    docker restart "$cname" && success "$cname 已重启" || error "重启失败"
+                    (docker restart "$cname" 2>/dev/null || (compose stop "$cname" 2>/dev/null && compose up -d "$cname")) && success "$cname 已重启" || error "重启失败"
                 fi
                 pause
                 ;;
@@ -601,67 +642,11 @@ menu_service_control() {
 # ------------------------------------------------------------------------------
 # 菜单功能 2: 组件配置与加装
 # ------------------------------------------------------------------------------
-menu_component_selection() {
-    while true; do
-        clear 2>/dev/null || echo ""
-        load_env
-        echo -e "${CYAN}================== [2] 组件定制与加装 ==================${RESET}"
-        echo -e " 当前启用的组件: ${GREEN}${ENABLED_SERVICES}${RESET}"
-        echo -e " 说明: 您可以按需开启或关闭各个组件，切换后将自动重构容器架构。"
-        echo -e " ---------------------------------------------------------"
-        echo -e " 1. [$(is_service_enabled 'newapi' && echo -e "${GREEN}✓ 启用${RESET}" || echo -e "${RED}✗ 禁用${RESET}")] NewAPI (AI 聚合渠道分发网关)"
-        echo -e " 2. [$(is_service_enabled 'grok2api' && echo -e "${GREEN}✓ 启用${RESET}" || echo -e "${RED}✗ 禁用${RESET}")] Grok2API (Grok 逆向与多账号池网关)"
-        echo -e " 3. [$(is_service_enabled 'cliproxy' && echo -e "${GREEN}✓ 启用${RESET}" || echo -e "${RED}✗ 禁用${RESET}")] CLIProxyAPI (Claude/Codex/GrokBuild OAuth 代理)"
-        echo -e " 4. [$(is_service_enabled 'workbuddy' && echo -e "${GREEN}✓ 启用${RESET}" || echo -e "${RED}✗ 禁用${RESET}")] WorkBuddy2API (Gemini/Claude 多功能网关)"
-        echo -e " ---------------------------------------------------------"
-        echo -e " 5. ${BOLD}${MAGENTA}应用变更并立即重新部署容器${RESET}"
-        echo -e " 6. 全选并开启所有 4 大核心服务"
-        echo -e " 0. 返回主菜单 (放弃未应用修改)"
-        echo -e "${CYAN}===========================================================${RESET}"
-        read -r -p "请输入切换组件编号 [0-6]: " opt
-        case "$opt" in
-            1)
-                toggle_service "newapi"
-                ;;
-            2)
-                toggle_service "grok2api"
-                ;;
-            3)
-                toggle_service "cliproxy"
-                ;;
-            4)
-                toggle_service "workbuddy"
-                ;;
-            5)
-                info "正在应用组件配置并重新启动 Docker Compose..."
-                generate_compose
-                compose up -d --remove-orphans
-                success "组件重构与应用完成！"
-                pause
-                break
-                ;;
-            6)
-                ENABLED_SERVICES="newapi,grok2api,cliproxy,workbuddy"
-                save_env
-                success "已设置为全量 4 大核心服务！"
-                sleep 1
-                ;;
-            0)
-                load_env
-                break
-                ;;
-            *)
-                warn "无效输入！"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-toggle_service() {
+toggle_service_list() {
     local target="$1"
+    local cur_list="$2"
     local list=()
-    IFS=',' read -r -a current <<< "$ENABLED_SERVICES"
+    IFS=',' read -r -a current <<< "$cur_list"
     local found=false
     for s in "${current[@]}"; do
         if [ "$s" = "$target" ]; then
@@ -675,9 +660,79 @@ toggle_service() {
         list+=("$target")
     fi
 
-    # 重新拼接
-    ENABLED_SERVICES=$(IFS=','; echo "${list[*]}")
+    IFS=','; echo "${list[*]}"
+}
+
+toggle_service() {
+    local target="$1"
+    ENABLED_SERVICES=$(toggle_service_list "$target" "$ENABLED_SERVICES")
     save_env
+}
+
+menu_component_selection() {
+    load_env
+    local temp_services="$ENABLED_SERVICES"
+    while true; do
+        clear 2>/dev/null || echo ""
+        echo -e "${CYAN}================== [2] 组件定制与加装 ==================${RESET}"
+        echo -e " 当前待应用组件: ${GREEN}${temp_services:-（无）}${RESET}"
+        echo -e " 说明: 您可以按需开启或关闭各个组件，确认后选择 [5] 保存并生效。"
+        echo -e " ---------------------------------------------------------"
+        echo -e " 1. [$(is_service_enabled 'newapi' "$temp_services" && echo -e "${GREEN}✓ 启用${RESET}" || echo -e "${RED}✗ 禁用${RESET}")] NewAPI (AI 聚合渠道分发网关)"
+        echo -e " 2. [$(is_service_enabled 'grok2api' "$temp_services" && echo -e "${GREEN}✓ 启用${RESET}" || echo -e "${RED}✗ 禁用${RESET}")] Grok2API (Grok 逆向与多账号池网关)"
+        echo -e " 3. [$(is_service_enabled 'cliproxy' "$temp_services" && echo -e "${GREEN}✓ 启用${RESET}" || echo -e "${RED}✗ 禁用${RESET}")] CLIProxyAPI (Claude/Codex/GrokBuild OAuth 代理)"
+        echo -e " 4. [$(is_service_enabled 'workbuddy' "$temp_services" && echo -e "${GREEN}✓ 启用${RESET}" || echo -e "${RED}✗ 禁用${RESET}")] WorkBuddy2API (Gemini/Claude 多功能网关)"
+        echo -e " ---------------------------------------------------------"
+        echo -e " 5. ${BOLD}${MAGENTA}应用变更并立即重新部署容器${RESET}"
+        echo -e " 6. 全选并开启所有 4 大核心服务"
+        echo -e " 0. 返回主菜单 (放弃未应用修改)"
+        echo -e "${CYAN}===========================================================${RESET}"
+        read -r -p "请输入切换组件编号 [0-6]: " opt
+        case "$opt" in
+            1)
+                temp_services=$(toggle_service_list "newapi" "$temp_services")
+                ;;
+            2)
+                temp_services=$(toggle_service_list "grok2api" "$temp_services")
+                ;;
+            3)
+                temp_services=$(toggle_service_list "cliproxy" "$temp_services")
+                ;;
+            4)
+                temp_services=$(toggle_service_list "workbuddy" "$temp_services")
+                ;;
+            5)
+                if [ -z "$temp_services" ]; then
+                    warn "错误: 必须至少启用一个核心组件！已自动恢复全部启用。"
+                    temp_services="newapi,grok2api,cliproxy,workbuddy"
+                    sleep 1
+                    continue
+                fi
+                ENABLED_SERVICES="$temp_services"
+                save_env
+                info "正在应用组件配置并重新启动 Docker Compose..."
+                generate_compose
+                compose up -d --remove-orphans
+                success "组件重构与应用完成！"
+                pause
+                break
+                ;;
+            6)
+                temp_services="newapi,grok2api,cliproxy,workbuddy"
+                success "已全选 4 大核心服务！请选择 5 应用变更。"
+                sleep 1
+                ;;
+            0)
+                # 放弃未应用的修改，重新载入原有配置
+                load_env
+                break
+                ;;
+            *)
+                warn "无效输入！"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # ------------------------------------------------------------------------------
@@ -694,17 +749,27 @@ menu_view_logs() {
     echo -e " ---------------------------------------------------------"
     echo -e " ${WHITE}0.${RESET} 返回主菜单"
     echo -e "${CYAN}===========================================================${RESET}"
-    echo -e "${DIM}提示: 进入日志查看后，按下 Ctrl+C 即可退出日志回到菜单。${RESET}"
+    echo -e "${DIM}提示: 进入日志查看后，按下 Ctrl+C 即可安全退出日志回到菜单。${RESET}"
     read -r -p "请选择服务 [0-5]: " opt
+
+    local log_interrupted=false
+    trap 'log_interrupted=true; echo ""' INT
+
     case "$opt" in
         1) compose logs -f --tail=100 new-api ;;
         2) compose logs -f --tail=100 grok2api ;;
         3) compose logs -f --tail=100 cli-proxy-api ;;
         4) compose logs -f --tail=100 workbuddy2api ;;
         5) compose logs -f --tail=50 ;;
-        0) return ;;
+        0) trap - INT; return ;;
         *) warn "无效选项" ; sleep 1 ;;
     esac
+
+    trap - INT
+    if [ "$log_interrupted" = true ]; then
+        info "已退出实时日志跟踪。"
+    fi
+    pause
 }
 
 # ------------------------------------------------------------------------------
@@ -719,6 +784,44 @@ menu_status_monitor() {
     echo -e "${BOLD}实时资源开销 (CPU / 内存 / 网络 I/O / 磁盘 I/O):${RESET}"
     docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" $(docker ps -q --filter "network=aiproxy-net" 2>/dev/null) 2>/dev/null || docker stats --no-stream
     pause
+}
+
+# ------------------------------------------------------------------------------
+# 端口校验与冲突检测
+# ------------------------------------------------------------------------------
+is_valid_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+check_host_port_conflict() {
+    local port="$1"
+    local svc_cname="$2"
+    if ! is_valid_port "$port"; then
+        return 1
+    fi
+    local in_use=false
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tulpn 2>/dev/null | grep -E ":${port}\b" >/dev/null; then
+            in_use=true
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        if netstat -tulpn 2>/dev/null | grep -E ":${port}\b" >/dev/null; then
+            in_use=true
+        fi
+    elif command -v lsof >/dev/null 2>&1; then
+        if lsof -i ":${port}" >/dev/null 2>&1; then
+            in_use=true
+        fi
+    fi
+
+    if [ "$in_use" = true ]; then
+        if [ -n "$svc_cname" ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qw "$svc_cname"; then
+            return 0
+        fi
+        return 2
+    fi
+    return 0
 }
 
 # ------------------------------------------------------------------------------
@@ -772,10 +875,57 @@ menu_network_mode() {
             read -r -p "Grok2API 端口 [默认 $GROK2API_PORT]: " p2
             read -r -p "CLIProxy 端口 [默认 $CLIPROXY_PORT]: " p3
             read -r -p "WorkBuddy 端口 [默认 $WORKBUDDY_PORT]: " p4
-            [ -n "$p1" ] && NEWAPI_PORT="$p1"
-            [ -n "$p2" ] && GROK2API_PORT="$p2"
-            [ -n "$p3" ] && CLIPROXY_PORT="$p3"
-            [ -n "$p4" ] && WORKBUDDY_PORT="$p4"
+            local np1="${p1:-$NEWAPI_PORT}"
+            local np2="${p2:-$GROK2API_PORT}"
+            local np3="${p3:-$CLIPROXY_PORT}"
+            local np4="${p4:-$WORKBUDDY_PORT}"
+
+            # 校验端口格式
+            for p in "$np1" "$np2" "$np3" "$np4"; do
+                if ! is_valid_port "$p"; then
+                    error "端口 $p 格式无效！端口必须为 1-65535 之间的整数。"
+                    pause
+                    return
+                fi
+            done
+
+            # 校验项目各服务端口是否内部冲突
+            if [ "$np1" = "$np2" ] || [ "$np1" = "$np3" ] || [ "$np1" = "$np4" ] || \
+               [ "$np2" = "$np3" ] || [ "$np2" = "$np4" ] || [ "$np3" = "$np4" ]; then
+                error "配置错误：各组件监听端口不能互相重复冲突！"
+                pause
+                return
+            fi
+
+            # 校验宿主机端口占用
+            local warn_msg=""
+            if ! check_host_port_conflict "$np1" "new-api"; then
+                [ $? -eq 2 ] && warn_msg="NewAPI 端口 $np1"
+            fi
+            if ! check_host_port_conflict "$np2" "grok2api"; then
+                [ $? -eq 2 ] && warn_msg="${warn_msg:+$warn_msg, }Grok2API 端口 $np2"
+            fi
+            if ! check_host_port_conflict "$np3" "cli-proxy-api"; then
+                [ $? -eq 2 ] && warn_msg="${warn_msg:+$warn_msg, }CLIProxy 端口 $np3"
+            fi
+            if ! check_host_port_conflict "$np4" "workbuddy2api"; then
+                [ $? -eq 2 ] && warn_msg="${warn_msg:+$warn_msg, }WorkBuddy 端口 $np4"
+            fi
+
+            if [ -n "$warn_msg" ]; then
+                warn "检测到宿主机外部进程可能已占用: ${warn_msg}！"
+                read -r -p "是否仍然强制应用？(y/N): " force_apply
+                if [[ ! "$force_apply" =~ ^[Yy]$ ]]; then
+                    info "已取消端口修改。"
+                    pause
+                    return
+                fi
+            fi
+
+            NEWAPI_PORT="$np1"
+            GROK2API_PORT="$np2"
+            CLIPROXY_PORT="$np3"
+            WORKBUDDY_PORT="$np4"
             save_env
             generate_compose
             compose up -d
@@ -862,6 +1012,10 @@ create_swap() {
         rm -f "$swap_file"
     fi
 
+    # 针对 Btrfs 文件系统关闭 CoW 写时复制属性，避免 swapon 报 Invalid argument
+    touch "$swap_file" 2>/dev/null || true
+    chattr +C "$swap_file" 2>/dev/null || true
+
     # 尝试使用 fallocate，失败则降级为 dd
     info "分配磁盘空间 (${size_mb}MB)..."
     if ! fallocate -l "${size_mb}M" "$swap_file" 2>/dev/null; then
@@ -888,12 +1042,16 @@ tune_swappiness() {
     sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
 
     if [ -f /etc/sysctl.conf ]; then
-        if grep -q "^vm.swappiness" /etc/sysctl.conf; then
-            sed -i 's/^vm.swappiness=.*/vm.swappiness=10/' /etc/sysctl.conf
+        if grep -qE '^[[:space:]]*vm\.swappiness' /etc/sysctl.conf; then
+            sed -i -E 's/^[[:space:]]*vm\.swappiness[[:space:]]*=.*/vm.swappiness=10/' /etc/sysctl.conf
         else
             echo "vm.swappiness=10" >> /etc/sysctl.conf
         fi
         success "已永久写入 /etc/sysctl.conf (vm.swappiness=10)！"
+    fi
+
+    if [ -d /etc/sysctl.d ]; then
+        echo "vm.swappiness=10" > /etc/sysctl.d/99-aiproxy.conf 2>/dev/null || true
     fi
 }
 
@@ -908,7 +1066,7 @@ delete_swap() {
     swapoff "$swap_file" 2>/dev/null || true
     rm -f "$swap_file"
     if [ -f /etc/fstab ]; then
-        sed -i '\|/swapfile swap swap|d' /etc/fstab
+        sed -i '\|/swapfile[[:space:]]|d' /etc/fstab
     fi
     success "Swap 虚拟内存已完全移除！"
 }
@@ -994,8 +1152,15 @@ run_connectivity_test() {
     echo ""
     info "正在开始执行服务健康与连通性测试..."
 
-    # 测试宿主机直连端口
-    local test_services=("Grok2API:$BIND_IP:$GROK2API_PORT:grok2api" "CLIProxyAPI:$BIND_IP:$CLIPROXY_PORT:cli-proxy-api" "WorkBuddy2API:$BIND_IP:$WORKBUDDY_PORT:workbuddy2api" "NewAPI:$BIND_IP:$NEWAPI_PORT:new-api")
+    # 测试宿主机直连端口 (0.0.0.0 测试时回环到 127.0.0.1)
+    local test_ip="$BIND_IP"
+    [ "$test_ip" = "0.0.0.0" ] && test_ip="127.0.0.1"
+
+    local test_services=()
+    is_service_enabled "newapi" && test_services+=("NewAPI:$test_ip:$NEWAPI_PORT:new-api")
+    is_service_enabled "grok2api" && test_services+=("Grok2API:$test_ip:$GROK2API_PORT:grok2api")
+    is_service_enabled "cliproxy" && test_services+=("CLIProxyAPI:$test_ip:$CLIPROXY_PORT:cli-proxy-api")
+    is_service_enabled "workbuddy" && test_services+=("WorkBuddy2API:$test_ip:$WORKBUDDY_PORT:workbuddy2api")
 
     for item in "${test_services[@]}"; do
         IFS=':' read -r name ip port cname <<< "$item"
@@ -1016,14 +1181,38 @@ run_connectivity_test() {
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -qw "new-api"; then
         echo ""
         info "正在测试 NewAPI 容器内网桥接访问 (${CYAN}aiproxy-net${RESET})..."
-        local internal_targets=("grok2api:8000" "cli-proxy-api:8317" "workbuddy2api:7863")
-        for target in "${internal_targets[@]}"; do
-            local incode
-            incode=$(docker exec new-api curl -s -o /dev/null -w "%{http_code}" -m 3 "http://${target}" 2>/dev/null || echo "FAIL")
-            if [ "$incode" != "FAIL" ] && [ "$incode" != "000" ]; then
-                echo -e " [内网直连] NewAPI ➔ http://${target}: ${GREEN}✓ 连通正常 (HTTP Code: $incode)${RESET}"
+        local internal_targets=()
+        is_service_enabled "grok2api" && internal_targets+=("Grok2API:grok2api:8000")
+        is_service_enabled "cliproxy" && internal_targets+=("CLIProxyAPI:cli-proxy-api:8317")
+        is_service_enabled "workbuddy" && internal_targets+=("WorkBuddy2API:workbuddy2api:7863")
+
+        for item in "${internal_targets[@]}"; do
+            IFS=':' read -r sname target port <<< "$item"
+            # 兼容检测: calciumion/new-api 容器基于 Alpine，默认自带 wget，部分版本含 curl
+            local incode="FAIL"
+            incode=$(docker exec new-api sh -c "
+                if command -v curl >/dev/null 2>&1; then
+                    curl -s -o /dev/null -w '%{http_code}' -m 3 'http://${target}:${port}' 2>/dev/null || echo FAIL
+                elif command -v wget >/dev/null 2>&1; then
+                    status=\$(wget -S -O /dev/null -T 3 'http://${target}:${port}' 2>&1 | awk '/HTTP\// {print \$2}' | tail -n 1)
+                    if [ -n \"\$status\" ]; then
+                        echo \"\$status\"
+                    elif wget -q -O /dev/null -T 3 'http://${target}:${port}' 2>/dev/null; then
+                        echo \"200\"
+                    else
+                        echo \"FAIL\"
+                    fi
+                elif command -v nc >/dev/null 2>&1; then
+                    nc -z -w 3 '${target}' '${port}' >/dev/null 2>&1 && echo \"OPEN\" || echo \"FAIL\"
+                else
+                    echo \"FAIL\"
+                fi
+            " 2>/dev/null || echo "FAIL")
+
+            if [ "$incode" != "FAIL" ] && [ "$incode" != "000" ] && [ -n "$incode" ]; then
+                echo -e " [内网直连] NewAPI ➔ http://${target}:${port} (${sname}): ${GREEN}✓ 连通正常 (HTTP Code: $incode)${RESET}"
             else
-                echo -e " [内网直连] NewAPI ➔ http://${target}: ${YELLOW}○ 无响应或目标未开启${RESET}"
+                echo -e " [内网直连] NewAPI ➔ http://${target}:${port} (${sname}): ${YELLOW}○ 无响应或目标未就绪${RESET}"
             fi
         done
     fi
@@ -1054,32 +1243,53 @@ menu_caddy_helper() {
         return
     fi
 
-    echo ""
-    echo -e "${BOLD}已为您生成推荐的 Caddyfile 独立反代配置代码:${RESET}"
-    echo -e "${MAGENTA}----------------------------------------------------------------------${RESET}"
-    cat <<EOF
-# ==================== aiproxy-box 反向代理块开始 ====================
+    # 动态组装已启用服务的 Caddy 反代配置
+    local caddy_blocks=""
+    if is_service_enabled "newapi"; then
+        caddy_blocks="${caddy_blocks}
 # NewAPI 统一中转面板 (支持自动签发 Let's Encrypt SSL)
 api.${domain} {
     reverse_proxy 127.0.0.1:${NEWAPI_PORT}
 }
-
+"
+    fi
+    if is_service_enabled "grok2api"; then
+        caddy_blocks="${caddy_blocks}
 # Grok2API 独立接口端点
 grok.${domain} {
     reverse_proxy 127.0.0.1:${GROK2API_PORT}
 }
-
+"
+    fi
+    if is_service_enabled "cliproxy"; then
+        caddy_blocks="${caddy_blocks}
 # CLIProxyAPI 独立管理与接口
 cliproxy.${domain} {
     reverse_proxy 127.0.0.1:${CLIPROXY_PORT}
 }
-
+"
+    fi
+    if is_service_enabled "workbuddy"; then
+        caddy_blocks="${caddy_blocks}
 # WorkBuddy2API 独立接口
 workbuddy.${domain} {
     reverse_proxy 127.0.0.1:${WORKBUDDY_PORT}
 }
-# ==================== aiproxy-box 反向代理块结束 ====================
-EOF
+"
+    fi
+
+    if [ -z "$caddy_blocks" ]; then
+        warn "当前未启用任何服务，无须生成反代配置！"
+        pause
+        return
+    fi
+
+    echo ""
+    echo -e "${BOLD}已为您生成已启用服务的 Caddyfile 反代配置代码:${RESET}"
+    echo -e "${MAGENTA}----------------------------------------------------------------------${RESET}"
+    echo "# ==================== aiproxy-box 反向代理块开始 ===================="
+    echo "$caddy_blocks"
+    echo "# ==================== aiproxy-box 反向代理块结束 ===================="
     echo -e "${MAGENTA}----------------------------------------------------------------------${RESET}"
 
     if [ "$has_caddy" = true ] && [ -f /etc/caddy/Caddyfile ]; then
@@ -1088,18 +1298,7 @@ EOF
             cat <<EOF >> /etc/caddy/Caddyfile
 
 # === aiproxy-box auto reverse proxy block ===
-api.${domain} {
-    reverse_proxy 127.0.0.1:${NEWAPI_PORT}
-}
-grok.${domain} {
-    reverse_proxy 127.0.0.1:${GROK2API_PORT}
-}
-cliproxy.${domain} {
-    reverse_proxy 127.0.0.1:${CLIPROXY_PORT}
-}
-workbuddy.${domain} {
-    reverse_proxy 127.0.0.1:${WORKBUDDY_PORT}
-}
+$caddy_blocks
 EOF
             caddy reload --config /etc/caddy/Caddyfile 2>/dev/null && success "已追加配置并重载 Caddy！" || warn "配置已追加，但重载可能需要手动执行: caddy reload"
         fi
@@ -1131,12 +1330,24 @@ menu_backup() {
     local backup_name="aiproxy-box-backup-$(date '+%Y%m%d_%H%M%S').tar.gz"
     info "正在打包凭证、数据库与配置文件到: $backup_name ..."
 
+    # 检查待备份的关键项是否存在，防止 tar 报错
+    local items=()
+    for f in data .env templates docker-compose.yml; do
+        [ -e "$APP_DIR/$f" ] && items+=("$f")
+    done
+
+    if [ ${#items[@]} -eq 0 ]; then
+        warn "未检测到可备份的文件（请先运行或初始化服务）！"
+        pause
+        return
+    fi
+
     # 排除大体积临时日志，仅备份配置和关键数据
     tar -czf "$APP_DIR/$backup_name" \
         -C "$APP_DIR" \
         --exclude="*.log" \
         --exclude="*.tar.gz" \
-        data .env templates docker-compose.yml 2>/dev/null
+        "${items[@]}" 2>/dev/null
 
     if [ -f "$APP_DIR/$backup_name" ]; then
         local bsize
@@ -1189,7 +1400,15 @@ menu_uninstall() {
     fi
 
     rm -f "/usr/local/bin/aiproxy"
-    success "aiproxy-box 卸载完成！"
+    success "aiproxy-box 容器与快捷方式卸载完成！"
+
+    if [ "$APP_DIR" = "/opt/aiproxy-box" ]; then
+        read -r -p "是否同时删除项目安装目录 ($APP_DIR)？(y/N): " rm_dir
+        if [[ "$rm_dir" =~ ^[Yy]$ ]]; then
+            info "正在清理 $APP_DIR ..."
+            rm -rf "$APP_DIR"
+        fi
+    fi
     pause
     exit 0
 }
@@ -1198,7 +1417,9 @@ menu_uninstall() {
 # 主菜单交互循环
 # ------------------------------------------------------------------------------
 main_menu() {
-    load_env
+    ensure_initialized
+    # 捕获 Ctrl+C 防止意外退出主循环
+    trap 'echo ""; echo -e "\n${GREEN}[INFO] 如需退出 aiproxy 控制台，请输入 0 回车。${RESET}"' INT
     while true; do
         print_header
         echo -e " ${BOLD}核心功能操作:${RESET}"
@@ -1246,12 +1467,17 @@ cli_dispatch() {
         menu|"")
             main_menu
             ;;
+        init)
+            info "正在初始化 aiproxy-box 基础配置与 Compose 编排..."
+            ensure_initialized
+            success "项目环境与 Compose 编排文件初始化完成！"
+            ;;
         status)
             print_header
             ;;
         start)
             if [ -n "$2" ]; then
-                docker start "$2"
+                docker start "$2" 2>/dev/null || compose up -d "$2"
             else
                 generate_compose
                 compose up -d
@@ -1266,7 +1492,7 @@ cli_dispatch() {
             ;;
         restart)
             if [ -n "$2" ]; then
-                docker restart "$2"
+                docker restart "$2" 2>/dev/null || (compose stop "$2" && compose up -d "$2")
             else
                 generate_compose
                 compose restart
@@ -1292,6 +1518,7 @@ cli_dispatch() {
         help|--help|-h)
             echo "aiproxy-box CLI 命令行调用说明:"
             echo "  aiproxy               - 开启交互式 TUI 字符菜单"
+            echo "  aiproxy init          - 初始化项目配置并生成 Compose 文件"
             echo "  aiproxy status        - 打印当前服务与资源状态"
             echo "  aiproxy start [svc]   - 启动所有或指定容器"
             echo "  aiproxy stop [svc]    - 停止所有或指定容器"

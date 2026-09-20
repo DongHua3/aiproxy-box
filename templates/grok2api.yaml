@@ -1,0 +1,66 @@
+# Grok2API 初始配置文件模版
+# 官方仓库: https://github.com/chenyme/grok2api
+# 容器内部读取路径: /run/grok2api/config.yaml
+
+server:
+  listen: "0.0.0.0:8000"
+  maxBodyBytes: 33554432
+  trustedProxies: []
+  readTimeout: 15m
+  requestTimeout: 2h
+  swaggerEnabled: false
+
+auth:
+  accessTokenTTL: 15m
+  refreshTokenTTL: 720h
+  secureCookies: false
+
+secrets:
+  # 初始化时 aiproxy.sh 会自动生成高强度随机密钥替换下列占位符
+  jwtSecret: "CHANGE_ME_JWT_SECRET_32_HEX_CHARACTERS"
+  credentialEncryptionKey: "CHANGE_ME_BASE64_ENCRYPTION_KEY_32_BYTES"
+
+bootstrapAdmin:
+  username: "admin"
+  password: "grok2api_default_password"
+
+frontend:
+  staticPath: "./frontend/dist"
+
+database:
+  driver: sqlite
+  sqlite:
+    path: "./data/backend.db"
+
+runtimeStore:
+  driver: memory
+
+deployment:
+  replicas: 1
+  clusterID: "grok2api"
+  sharedMedia: false
+
+media:
+  driver: local
+  local:
+    path: "./data/media"
+
+routing:
+  reasoningReplayEnabled: true
+  reasoningReplayTTL: 1h
+  reasoningReplayMaxEntries: 10240
+  accountIsolatedConnections: false
+  segmentedSelectorEnabled: true
+  segmentedSelectorMinCandidates: 3000
+  segmentedSelectorWindowSize: 64
+
+audit:
+  bufferSize: 16384
+  batchSize: 256
+  flushInterval: 250ms
+  commitDelay: 5ms
+  retentionDays: 7
+  ledgerMode: enforce
+  ledgerFailureThreshold: 1
+  ledgerUnhealthyGrace: 10s
+  ledgerQueueHighWatermarkPercent: 90

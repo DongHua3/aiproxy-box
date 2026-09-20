@@ -1,0 +1,46 @@
+# CLIProxyAPI 初始配置文件模版
+# 官方仓库: https://github.com/router-for-me/CLIProxyAPI
+# 容器内部读取路径: /CLIProxyAPI/config.yaml
+
+# 监听地址与端口
+host: "0.0.0.0"
+port: 8317
+
+# TLS 配置 (默认关闭，建议通过外部 Caddy / Nginx 统一配置 HTTPS)
+tls:
+  enable: false
+  cert: ""
+  key: ""
+
+# 认证凭据目录 (容器内映射路径)
+auth-dir: "/root/.cli-proxy-api"
+
+# 客户端调用 API 密钥 (请求时使用 Bearer 认证)
+api-keys:
+  - "sk-cliproxy-default-key"
+
+# 远程管理控制台 (访问路径: http://IP:8317/management.html)
+remote-management:
+  allow-remote: true
+  secret-key: "aiproxy-cliproxy-admin"
+  disable-control-panel: false
+  panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+
+# 日志与调试
+debug: false
+logging-to-file: false
+
+# 路由与重试机制
+routing:
+  strategy: "round-robin" # round-robin | weighted-round-robin | fill-first
+  session-affinity: false
+  session-affinity-ttl: "1h"
+
+request-retry: 3
+max-retry-credentials: 0
+max-retry-interval: 30
+disable-cooling: false
+
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true

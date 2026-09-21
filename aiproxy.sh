@@ -164,7 +164,7 @@ get_swap_info() {
     echo "${total_mb:-0} ${free_mb:-0}"
 }
 
-CACHED_HOST_IP=""
+CACHED_HOST_IP="${CACHED_HOST_IP:-}"
 
 ensure_host_ip() {
     if [ -n "$CACHED_HOST_IP" ]; then
@@ -176,7 +176,13 @@ ensure_host_ip() {
          curl -s -m 1 https://api.ipify.org 2>/dev/null || \
          hostname -I 2>/dev/null | awk '{print $1}')
     ip=$(echo "$ip" | tr -d ' \r\n')
-    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    local is_valid=false
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        is_valid=true
+    elif [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]]; then
+        is_valid=true
+    fi
+    if [ "$is_valid" = false ]; then
         ip="127.0.0.1"
     fi
     CACHED_HOST_IP="$ip"
@@ -217,6 +223,12 @@ load_env() {
     CLIPROXY_PORT="${CLIPROXY_PORT:-8317}"
     WORKBUDDY_PORT="${WORKBUDDY_PORT:-7863}"
     NEWAPI_INITIAL_ROOT_PASSWORD="${NEWAPI_INITIAL_ROOT_PASSWORD:-}"
+    if [ -z "$NEWAPI_INITIAL_ROOT_PASSWORD" ]; then
+        NEWAPI_INITIAL_ROOT_PASSWORD=$(generate_random_hex 16)
+        if [ -f "$ENV_FILE" ] && ! grep -q '^[[:space:]]*NEWAPI_INITIAL_ROOT_PASSWORD=' "$ENV_FILE" 2>/dev/null; then
+            echo "NEWAPI_INITIAL_ROOT_PASSWORD=$NEWAPI_INITIAL_ROOT_PASSWORD" >> "$ENV_FILE"
+        fi
+    fi
     TZ="${TZ:-Asia/Shanghai}"
 }
 
@@ -763,7 +775,7 @@ menu_service_control() {
                 read -r -p "请输入要停止的容器名称: " cname
                 cname=$(normalize_service_name "$cname")
                 if [ -n "$cname" ]; then
-                    if docker stop "$cname"; then
+                    if docker stop "$cname" 2>/dev/null || compose stop "$cname"; then
                         success "$cname 已停止"
                     else
                         error "停止失败，请检查容器状态！"
@@ -964,7 +976,7 @@ check_host_port_conflict() {
     if [ "$in_use" = true ]; then
         if [ -n "$svc_cname" ]; then
             local mapped_ports
-            mapped_ports=$(docker inspect --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}}{{"\n"}}{{end}}{{end}}' "$svc_cname" 2>/dev/null || true)
+            mapped_ports=$(docker inspect --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}}{{"\n"}}{{end}}{{end}}' "$svc_cname" 2>/dev/null | tr -d '\r' || true)
             if echo "$mapped_ports" | grep -qx "$port"; then
                 return 0
             fi
@@ -1164,6 +1176,10 @@ menu_swap_manager() {
 create_swap() {
     local size_mb="$1"
     [ "$(id -u)" -eq 0 ] || { error "必须以 root 权限运行创建 Swap！"; return 1; }
+    if [[ ! "$size_mb" =~ ^[0-9]+$ ]] || [ "$size_mb" -le 0 ]; then
+        error "Swap 容量必须为有效正整数 (MB)！"
+        return 1
+    fi
 
     info "准备创建 ${size_mb}MB Swap 虚拟内存..."
     local swap_file="${SWAP_FILE:-/swapfile}"
@@ -1549,7 +1565,11 @@ workbuddy.${domain} {
         read -r -p "是否直接将上述配置写入 $caddyfile 并重载 Caddy? (y/N): " append_choice
         if [[ "$append_choice" =~ ^[Yy]$ ]]; then
             local bak_file="${caddyfile}.bak_$(date '+%Y%m%d_%H%M%S')"
-            cp "$caddyfile" "$bak_file" 2>/dev/null || true
+            if ! cp "$caddyfile" "$bak_file" 2>/dev/null; then
+                error "无法备份现有 Caddyfile 到 $bak_file，已终止以保护原始配置！"
+                pause
+                return 1
+            fi
             info "已备份现有 Caddyfile 到 $bak_file"
 
             local start_tag="# === aiproxy-box auto reverse proxy block start ==="
@@ -1674,11 +1694,21 @@ menu_uninstall() {
     info "正在停止并清理容器..."
     compose down -v --remove-orphans 2>/dev/null || true
 
+    local target_dir="${APP_DIR%/}"
+    [ -z "$target_dir" ] && target_dir="/"
+
     local rm_data="n"
     read -r -p "是否同时彻底删除所有凭证与持久化数据 (data/ 目录)？(y/N): " rm_data
     if [[ "$rm_data" =~ ^[Yy]$ ]]; then
-        rm -rf "$DATA_DIR" "$ENV_FILE" "$COMPOSE_FILE"
-        info "运行时数据已清空。"
+        case "$target_dir" in
+            ""|"/"|"/root"|"/home"|"/usr"|"/etc"|"/var"|"/bin"|"/boot"|"/dev"|"/proc"|"/sys")
+                error "安全拦截：当前处于系统关键目录，禁止清理数据与配置文件！"
+                ;;
+            *)
+                rm -rf "$DATA_DIR" "$ENV_FILE" "$COMPOSE_FILE"
+                info "运行时数据已清空。"
+                ;;
+        esac
     else
         info "已保留持久化凭据与数据目录: $DATA_DIR"
     fi
@@ -1688,8 +1718,8 @@ menu_uninstall() {
 
     read -r -p "是否清理项目主程序目录 ($APP_DIR)？(y/N): " rm_dir
     if [[ "$rm_dir" =~ ^[Yy]$ ]]; then
-        case "$APP_DIR" in
-            ""|"/"|"/root"|"/home"|"/usr"|"/etc"|"/var"|"/bin")
+        case "$target_dir" in
+            ""|"/"|"/root"|"/home"|"/usr"|"/etc"|"/var"|"/bin"|"/boot"|"/dev"|"/proc"|"/sys")
                 error "安全拦截：APP_DIR ($APP_DIR) 为系统关键目录，禁止递归删除！"
                 ;;
             *)
@@ -1815,7 +1845,7 @@ cli_dispatch() {
             if [ -n "$2" ]; then
                 local target
                 target=$(normalize_service_name "$2")
-                if docker stop "$target"; then
+                if docker stop "$target" 2>/dev/null || compose stop "$target"; then
                     success "服务 $target 已停止！"
                 else
                     error "服务 $target 停止失败！"

@@ -325,10 +325,30 @@ echo "[Test 15] 测试 create_swap 与 delete_swap 真实逻辑及 /etc/fstab no
         exit 1
     fi
 
-    # 2. 模拟 root 环境并直接调用真实 create_swap 函数
+    # 2. 验证非法入参校验拦截 (非正整数)
     id() {
         if [ "$1" = "-u" ]; then echo "0"; else command id "$@"; fi
     }
+    ret_inv=0
+    create_swap "abc" >/dev/null 2>&1 || ret_inv=$?
+    [ "$ret_inv" -eq 1 ] || { echo "✗ create_swap 未拦截非数字入参"; exit 1; }
+    echo "✓ create_swap 成功拦截非法参数"
+
+    # 3. 验证根分区磁盘余量不足安全拦截 (要求 >= size_mb + 512MB)
+    df() {
+        echo -e "Filesystem 1M-blocks Used Available Use% Mounted on\n/dev/sda1 10000 9000 1000 90% /"
+    }
+    ret_disk=0
+    create_swap 1024 >/dev/null 2>&1 || ret_disk=$?
+    if [ "$ret_disk" -eq 1 ]; then
+        echo "✓ 磁盘余量不足 (1000MB < 1536MB) 时成功拦截创建"
+    else
+        echo "✗ 磁盘余量不足时未能拦截: $ret_disk"
+        exit 1
+    fi
+    unset -f df
+
+    # 4. 模拟 root 环境与充足磁盘空间并直接调用真实 create_swap 函数
     fallocate() { touch "$SWAP_FILE"; return 0; }
     mkswap() { return 0; }
     swapon() { return 0; }
@@ -351,7 +371,7 @@ echo "[Test 15] 测试 create_swap 与 delete_swap 真实逻辑及 /etc/fstab no
         exit 1
     fi
 
-    # 3. 直接调用真实 delete_swap 函数测试残留条目清理
+    # 5. 直接调用真实 delete_swap 函数测试残留条目清理
     get_ram_info() { echo "4096 3072"; }
     get_swap_info() { echo "1024 1024"; }
     swapoff() { return 0; }
@@ -789,17 +809,17 @@ echo "[Test 32] 测试 menu_uninstall 核心系统目录安全拦截保护 (BUG-
     source aiproxy.sh
     compose() { return 0; }
 
-    for dangerous_path in "/" "/root" "/home" "/usr" "/etc" "/var" "/bin"; do
+    for dangerous_path in "/" "/root" "/root/" "/home" "/home/" "/usr" "/usr/" "/etc" "/etc/" "/var" "/bin"; do
         APP_DIR="$dangerous_path"
         out=$(printf "y\ny\ny\n" | menu_uninstall 2>&1 || true)
-        if echo "$out" | grep -q "安全拦截：APP_DIR ($dangerous_path) 为系统关键目录，禁止递归删除！"; then
+        if echo "$out" | grep -q "安全拦截"; then
             continue
         else
             echo "✗ 关键路径 $dangerous_path 未触发安全拦截: $out"
             exit 1
         fi
     done
-    echo "✓ 成功拦截所有 7 个系统关键目录的意外递归删除"
+    echo "✓ 成功拦截所有系统关键目录（含尾部斜杠变体）的意外递归删除"
 )
 echo "✓ Test 32 通过"
 
@@ -853,9 +873,124 @@ echo "[Test 34] 测试 Docker 与 Compose 失败时拦截假成功 (BUG-C03)..."
 )
 echo "✓ Test 34 通过"
 
+# Test 35: menu_channel_guide credentials parsing and rendering (BUG-H03)
+echo "[Test 35] 测试 menu_channel_guide 凭证动态解析与终端展示 (BUG-H03)..."
+(
+    cd test_env
+    source aiproxy.sh
+    init_service_configs
+    export ENABLED_SERVICES="newapi,grok2api,cliproxy,workbuddy"
+    save_env
+    export CACHED_HOST_IP="1.2.3.4"
+    guide_out=$(printf "0\n" | menu_channel_guide 2>&1 || true)
+
+    # 1. 验证 NewAPI 管理入口与密码
+    if echo "$guide_out" | grep -q "http://1.2.3.4:3000" && echo "$guide_out" | grep -q "$NEWAPI_INITIAL_ROOT_PASSWORD"; then
+        echo "✓ NewAPI 管理后台 URL 与动态初始密码正确展示"
+    else
+        echo "✗ NewAPI 管理后台凭据展示异常"
+        exit 1
+    fi
+
+    # 2. 验证 Grok2API 管理密码从 config.yaml 解析
+    grok_pass=$(grep -E '^[[:space:]]*password:' data/grok2api/config.yaml | awk '{print $2}' | tr -d '"' | tr -d "'")
+    if echo "$guide_out" | grep -q "http://1.2.3.4:8000" && echo "$guide_out" | grep -q "$grok_pass"; then
+        echo "✓ Grok2API 后台地址与管理员随机密码正确展示: $grok_pass"
+    else
+        echo "✗ Grok2API 管理员密码展示异常"
+        exit 1
+    fi
+
+    # 3. 验证 CLIProxyAPI secret-key 从 config.yaml 解析
+    cliproxy_sec=$(grep -E '^[[:space:]]*secret-key:' data/cliproxy/config.yaml | awk '{print $2}' | tr -d '"' | tr -d "'")
+    if echo "$guide_out" | grep -q "management.html" && echo "$guide_out" | grep -q "$cliproxy_sec"; then
+        echo "✓ CLIProxyAPI 管理控制台 Secret 正确展示: $cliproxy_sec"
+    else
+        echo "✗ CLIProxyAPI 管理 Secret 展示异常"
+        exit 1
+    fi
+)
+echo "✓ Test 35 通过"
+
+# Test 36: ensure_host_ip IPv4 and IPv6 format validation (BUG-L02)
+echo "[Test 36] 测试 ensure_host_ip 对 IPv4 与 IPv6 格式校验及非法 IP 回退 (BUG-L02)..."
+(
+    cd test_env
+    source aiproxy.sh
+    
+    # 1. IPv4 正常校验
+    curl() { echo "203.0.113.195"; }
+    CACHED_HOST_IP=""
+    ensure_host_ip
+    [ "$CACHED_HOST_IP" = "203.0.113.195" ] || { echo "✗ IPv4 识别失败: $CACHED_HOST_IP"; exit 1; }
+
+    # 2. IPv6 正常校验
+    curl() { echo "2001:db8::8a2e:370:7334"; }
+    CACHED_HOST_IP=""
+    ensure_host_ip
+    [ "$CACHED_HOST_IP" = "2001:db8::8a2e:370:7334" ] || { echo "✗ IPv6 识别失败: $CACHED_HOST_IP"; exit 1; }
+
+    # 3. 异常文本回退为 127.0.0.1
+    curl() { echo "<html>502 Bad Gateway</html>"; }
+    hostname() { echo ""; }
+    CACHED_HOST_IP=""
+    ensure_host_ip
+    [ "$CACHED_HOST_IP" = "127.0.0.1" ] || { echo "✗ 非法 IP 未能回退 127.0.0.1: $CACHED_HOST_IP"; exit 1; }
+
+    echo "✓ IPv4/IPv6 校验及非法回退逻辑符合预期"
+)
+echo "✓ Test 36 通过"
+
+# Test 37: menu_caddy_helper backup failure safety abort
+echo "[Test 37] 测试 menu_caddy_helper 备份失败时安全终止以防破坏 Caddyfile..."
+(
+    cd test_env
+    source aiproxy.sh
+    export CADDYFILE_PATH="$PWD/test_caddyfile_ro"
+    echo "# original caddyfile" > "$CADDYFILE_PATH"
+    cp() { return 1; } # 模拟备份文件创建失败
+    out_cad=$(printf "example.com\ny\n\n" | menu_caddy_helper 2>&1 || true)
+    if echo "$out_cad" | grep -q "无法备份现有 Caddyfile"; then
+        echo "✓ Caddyfile 备份失败时成功终止操作，保护原始文件未被修改"
+    else
+        echo "✗ Caddyfile 备份失败未能安全终止: $out_cad"
+        exit 1
+    fi
+    rm -f "$CADDYFILE_PATH"
+)
+echo "✓ Test 37 通过"
+
+# Test 38: cli_dispatch restart and update failure handling (BUG-C03)
+echo "[Test 38] 测试 cli_dispatch restart 与 update 失败拦截 (BUG-C03)..."
+(
+    cd test_env
+    source aiproxy.sh
+    compose() { return 1; }
+    docker() { return 1; }
+
+    ret_restart=0
+    out_restart=$(cli_dispatch restart 2>&1) || ret_restart=$?
+    if [ "$ret_restart" -eq 1 ] && echo "$out_restart" | grep -q "重启失败"; then
+        echo "✓ cli_dispatch restart 失败时精准拦截假成功"
+    else
+        echo "✗ cli_dispatch restart 假成功拦截异常: $out_restart"
+        exit 1
+    fi
+
+    ret_update=0
+    out_update=$(cli_dispatch update 2>&1) || ret_update=$?
+    if [ "$ret_update" -eq 1 ] && echo "$out_update" | grep -q "拉取失败"; then
+        echo "✓ cli_dispatch update 镜像拉取失败时精准拦截假成功"
+    else
+        echo "✗ cli_dispatch update 假成功拦截异常: $out_update"
+        exit 1
+    fi
+)
+echo "✓ Test 38 通过"
+
 # Clean test_env
 rm -rf test_env
 
 echo "=========================================="
-echo "🎉 全部 34 项自动化深度测试（含架构修复、密码学、SELinux、真实逻辑与系统可靠性）全部通过！"
+echo "🎉 全部 38 项自动化深度测试（含架构修复、密码学、SELinux、真实逻辑与系统可靠性）全部通过！"
 echo "=========================================="

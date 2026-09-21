@@ -91,18 +91,16 @@ if command -v git >/dev/null 2>&1; then
         }
     fi
 else
-    curl -fsSL "$REPO_ARCHIVE" | tar -xz -C "$INSTALL_DIR" --strip-components=1
+    curl -fsSL "$REPO_ARCHIVE" 2>/dev/null | tar -xz -C "$INSTALL_DIR" --strip-components=1 2>/dev/null || true
 fi
 
-# 如果安装脚本在本地被直接调用执行，同步当前脚本与模版文件
+# 如果安装脚本在本地代码仓库中被直接调用执行，同步当前脚本与模版文件
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ "$CURRENT_DIR" != "$INSTALL_DIR" ] && [ -f "$CURRENT_DIR/aiproxy.sh" ]; then
-    echo -e "${CYAN}[INFO] 同步本地文件至 ${INSTALL_DIR}...${RESET}"
-    shopt -s dotglob nullglob 2>/dev/null || true
-    for item in "$CURRENT_DIR"/*; do
-        [ -e "$item" ] && cp -rf "$item" "$INSTALL_DIR"/ 2>/dev/null || true
+if [ "$CURRENT_DIR" != "$INSTALL_DIR" ] && [ -f "$CURRENT_DIR/aiproxy.sh" ] && [ -d "$CURRENT_DIR/templates" ]; then
+    echo -e "${CYAN}[INFO] 同步本地代码文件至 ${INSTALL_DIR}...${RESET}"
+    for item in aiproxy.sh install.sh README.md templates LICENSE .gitignore; do
+        [ -e "$CURRENT_DIR/$item" ] && cp -rf "$CURRENT_DIR/$item" "$INSTALL_DIR"/ 2>/dev/null || true
     done
-    shopt -u dotglob nullglob 2>/dev/null || true
 fi
 
 # 5. 配置快捷命令与初始化权限

@@ -84,7 +84,7 @@ flowchart TD
 在您的 Linux VPS (Ubuntu / Debian / CentOS / Rocky 等) 上以 `root` 用户运行以下命令：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aiproxy-box/aiproxy-box/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DongHua3/aiproxy-box/main/install.sh | bash
 ```
 
 > 脚本将自动安装基础依赖、配置 Docker 运行时环境、克隆项目至 `/opt/aiproxy-box` 并注册 `/usr/local/bin/aiproxy` 全局软链接。
@@ -93,7 +93,7 @@ curl -fsSL https://raw.githubusercontent.com/aiproxy-box/aiproxy-box/main/instal
 
 ```bash
 # 克隆仓库
-git clone https://github.com/aiproxy-box/aiproxy-box.git /opt/aiproxy-box
+git clone https://github.com/DongHua3/aiproxy-box.git /opt/aiproxy-box
 cd /opt/aiproxy-box
 
 # 赋予执行权限并建立全局快捷命令
@@ -132,7 +132,7 @@ aiproxy
 
 | 服务组件 | 访问入口 | 初始账号 / 密钥机制 | 配置文件路径 |
 | :--- | :--- | :--- | :--- |
-| **NewAPI** | `http://IP:3000` | 初始管理员: `root` / 初始密码: `123456` | `data/newapi/api.db` |
+| **NewAPI** | `http://IP:3000` | 初始管理员: `root` / 初始密码: 随机生成 (`.env` 中 `NEWAPI_INITIAL_ROOT_PASSWORD`) | `data/newapi/api.db` |
 | **Grok2API** | `http://IP:8000` | `admin` / 随机生成密码 (自动注入 32 字节 AES-256 密钥) | `data/grok2api/config.yaml` |
 | **CLIProxyAPI** | `http://IP:8317` | 调用 Key: 随机动态生成 (`sk-cliproxy-...`)<br>管理后台 Key: 随机动态生成 | `data/cliproxy/config.yaml` |
 | **WorkBuddy2API** | `http://IP:7863` | 调用 Key: 随机动态生成 (`sk-workbuddy-...`) | `data/workbuddy/config.json` |

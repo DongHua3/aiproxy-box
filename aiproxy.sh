@@ -2,7 +2,7 @@
 # ==============================================================================
 # 项目名称: aiproxy-box (AI 代理全能工具箱)
 # 脚本功能: 交互式 TUI 字符菜单与自动化容器运维管理
-# 项目地址: https://github.com/aiproxy-box/aiproxy-box
+# 项目地址: https://github.com/DongHua3/aiproxy-box
 # 快捷命令: aiproxy
 # ==============================================================================
 
@@ -78,8 +78,16 @@ compose() {
     local cmd
     cmd=$(get_compose_cmd)
     if [ -z "$cmd" ]; then
-        error "未检测到 Docker Compose！请先通过菜单项或安装脚本安装 Docker 环境。"
-        return 1
+        error "未检测到 Docker Compose！"
+        read -r -p "是否立即自动安装 Docker 与 Compose 环境？(y/N): " inst_dk
+        if [[ "$inst_dk" =~ ^[Yy]$ ]]; then
+            if install_docker; then
+                cmd=$(get_compose_cmd)
+            fi
+        fi
+        if [ -z "$cmd" ]; then
+            return 1
+        fi
     fi
     $cmd -f "$COMPOSE_FILE" "$@"
 }
@@ -90,6 +98,9 @@ check_docker() {
     fi
     if [ -z "$(get_compose_cmd)" ]; then
         return 1
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        return 2
     fi
     return 0
 }
@@ -164,7 +175,11 @@ ensure_host_ip() {
          curl -s -m 1 https://icanhazip.com 2>/dev/null || \
          curl -s -m 1 https://api.ipify.org 2>/dev/null || \
          hostname -I 2>/dev/null | awk '{print $1}')
-    CACHED_HOST_IP="${ip:-127.0.0.1}"
+    ip=$(echo "$ip" | tr -d ' \r\n')
+    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        ip="127.0.0.1"
+    fi
+    CACHED_HOST_IP="$ip"
 }
 
 get_host_ip() {
@@ -201,10 +216,14 @@ load_env() {
     GROK2API_PORT="${GROK2API_PORT:-8000}"
     CLIPROXY_PORT="${CLIPROXY_PORT:-8317}"
     WORKBUDDY_PORT="${WORKBUDDY_PORT:-7863}"
+    NEWAPI_INITIAL_ROOT_PASSWORD="${NEWAPI_INITIAL_ROOT_PASSWORD:-}"
     TZ="${TZ:-Asia/Shanghai}"
 }
 
 save_env() {
+    if [ -z "$NEWAPI_INITIAL_ROOT_PASSWORD" ]; then
+        NEWAPI_INITIAL_ROOT_PASSWORD=$(generate_random_hex 16)
+    fi
     cat <<EOF > "$ENV_FILE"
 # ==============================================================================
 # aiproxy-box 环境与网络配置文件
@@ -222,6 +241,9 @@ NEWAPI_PORT=${NEWAPI_PORT:-3000}
 GROK2API_PORT=${GROK2API_PORT:-8000}
 CLIPROXY_PORT=${CLIPROXY_PORT:-8317}
 WORKBUDDY_PORT=${WORKBUDDY_PORT:-7863}
+
+# NewAPI 初始管理员密码
+NEWAPI_INITIAL_ROOT_PASSWORD=${NEWAPI_INITIAL_ROOT_PASSWORD}
 
 # 系统时区
 TZ=${TZ:-Asia/Shanghai}
@@ -302,6 +324,16 @@ generate_random_base64() {
 }
 
 init_service_configs() {
+    if [ -z "$NEWAPI_INITIAL_ROOT_PASSWORD" ]; then
+        if [ -f "$ENV_FILE" ]; then
+            NEWAPI_INITIAL_ROOT_PASSWORD=$(grep -E '^[[:space:]]*NEWAPI_INITIAL_ROOT_PASSWORD=' "$ENV_FILE" 2>/dev/null | cut -d '=' -f 2 | tr -d '\r\n')
+        fi
+        if [ -z "$NEWAPI_INITIAL_ROOT_PASSWORD" ]; then
+            NEWAPI_INITIAL_ROOT_PASSWORD=$(generate_random_hex 16)
+            save_env
+        fi
+    fi
+
     mkdir -p "$DATA_DIR/newapi"
     mkdir -p "$DATA_DIR/grok2api/data"
     mkdir -p "$DATA_DIR/cliproxy/auths"
@@ -354,12 +386,12 @@ init_service_configs() {
 
     # 修复 WorkBuddy2API 的 uid 10001 读写权限与目录安全防护 (替代 777)
     if [ -d "$DATA_DIR/workbuddy" ]; then
-        chmod 750 "$DATA_DIR/workbuddy" 2>/dev/null || true
-        [ -f "$DATA_DIR/workbuddy/config.json" ] && chmod 600 "$DATA_DIR/workbuddy/config.json" 2>/dev/null || true
+        chmod 755 "$DATA_DIR/workbuddy" 2>/dev/null || true
+        [ -f "$DATA_DIR/workbuddy/config.json" ] && chmod 644 "$DATA_DIR/workbuddy/config.json" 2>/dev/null || true
         if [ "$(id -u)" -eq 0 ]; then
-            chown -R 10001:10001 "$DATA_DIR/workbuddy" 2>/dev/null || true
+            chown -R 10001:10001 "$DATA_DIR/workbuddy/auths" "$DATA_DIR/workbuddy/data" 2>/dev/null || true
         fi
-        chmod 750 "$DATA_DIR/workbuddy/auths" "$DATA_DIR/workbuddy/data" 2>/dev/null || true
+        chmod 775 "$DATA_DIR/workbuddy/auths" "$DATA_DIR/workbuddy/data" 2>/dev/null || true
     fi
 }
 
@@ -389,11 +421,12 @@ generate_compose() {
     cat <<'EOF' > "$COMPOSE_FILE"
 # ==============================================================================
 # 由 aiproxy-box 自动化引擎动态组装生成 - 请勿直接手动修改
-# 生成时间: 
 EOF
     echo "# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')" >> "$COMPOSE_FILE"
     cat <<'EOF' >> "$COMPOSE_FILE"
 # ==============================================================================
+
+version: '3.8'
 
 networks:
   aiproxy-net:
@@ -416,6 +449,7 @@ EOF
       - ./data/newapi:/data:z
     environment:
       - TZ=\${TZ:-Asia/Shanghai}
+      - INITIAL_ROOT_PASSWORD=\${NEWAPI_INITIAL_ROOT_PASSWORD}
     networks:
       - aiproxy-net
     logging:
@@ -426,6 +460,7 @@ EOF
 EOF
         if [ "$is_low_spec" = true ]; then
             cat <<EOF >> "$COMPOSE_FILE"
+    mem_limit: 350M
     deploy:
       resources:
         limits:
@@ -458,6 +493,7 @@ EOF
 EOF
         if [ "$is_low_spec" = true ]; then
             cat <<EOF >> "$COMPOSE_FILE"
+    mem_limit: 250M
     deploy:
       resources:
         limits:
@@ -490,6 +526,7 @@ EOF
 EOF
         if [ "$is_low_spec" = true ]; then
             cat <<EOF >> "$COMPOSE_FILE"
+    mem_limit: 250M
     deploy:
       resources:
         limits:
@@ -523,6 +560,7 @@ EOF
 EOF
         if [ "$is_low_spec" = true ]; then
             cat <<EOF >> "$COMPOSE_FILE"
+    mem_limit: 200M
     deploy:
       resources:
         limits:
@@ -576,7 +614,6 @@ get_container_stats() {
 }
 
 print_header() {
-    clear 2>/dev/null || echo ""
     read -r ram_total ram_free <<< "$(get_ram_info)"
     read -r swap_total swap_free <<< "$(get_swap_info)"
     ensure_host_ip
@@ -596,6 +633,13 @@ print_header() {
 
     if [ "$ram_total" -le 1536 ] && [ "$swap_total" -lt 1024 ]; then
         echo -e " ${RED}⚠ 警告: 当前物理内存 <= 1.5GB 且 Swap 未达标，极易发生 OOM 崩溃！建议使用菜单 6 创建 Swap。${RESET}"
+    fi
+    local docker_stat=0
+    check_docker || docker_stat=$?
+    if [ "$docker_stat" -eq 1 ]; then
+        echo -e " ${RED}⚠ 严重警告: 系统未安装 Docker 或 Docker Compose！容器服务无法正常运行。${RESET}"
+    elif [ "$docker_stat" -eq 2 ]; then
+        echo -e " ${RED}⚠ 严重警告: Docker 守护进程未运行 (dockerd 处于停止状态)！请检查并启动 Docker 服务。${RESET}"
     fi
     echo -e "${CYAN}----------------------------------------------------------------------${RESET}"
     echo -e "${BOLD} 组件运行状态概览:${RESET}"
@@ -635,7 +679,7 @@ print_header() {
             fi
         fi
 
-        printf " %-16s %-18b %-20b %-20s %-20b\n" "$label" "$inst_str" "$run_str" "$bind_str" "$res_str"
+        printf " %-16s %-18b %-20b %-20b %-20b\n" "$label" "$inst_str" "$run_str" "$bind_str" "$res_str"
     done
     echo -e "${CYAN}======================================================================${RESET}"
 }
@@ -662,21 +706,30 @@ menu_service_control() {
             1)
                 info "正在启动全部服务..."
                 generate_compose
-                compose up -d
-                success "启动指令已执行！"
+                if compose up -d; then
+                    success "启动指令已执行！"
+                else
+                    error "服务启动失败，请检查 Docker 日志或端口占用情况！"
+                fi
                 pause
                 ;;
             2)
                 info "正在重启全部服务..."
                 generate_compose
-                compose restart
-                success "重启完毕！"
+                if compose restart; then
+                    success "重启完毕！"
+                else
+                    error "服务重启失败，请检查 Docker 日志！"
+                fi
                 pause
                 ;;
             3)
                 info "正在停止全部服务..."
-                compose down
-                success "所有容器已停止！"
+                if compose down; then
+                    success "所有容器已停止！"
+                else
+                    error "容器停止失败，请检查 Docker 状态！"
+                fi
                 pause
                 ;;
             4)
@@ -684,7 +737,11 @@ menu_service_control() {
                 read -r -p "请输入要启动的容器名称: " cname
                 cname=$(normalize_service_name "$cname")
                 if [ -n "$cname" ]; then
-                    (docker start "$cname" 2>/dev/null || compose up -d "$cname") && success "$cname 已启动" || error "启动失败"
+                    if (docker start "$cname" 2>/dev/null || compose up -d "$cname"); then
+                        success "$cname 已启动"
+                    else
+                        error "服务启动失败，请检查 Docker 日志或端口占用情况！"
+                    fi
                 fi
                 pause
                 ;;
@@ -693,7 +750,11 @@ menu_service_control() {
                 read -r -p "请输入要重启的容器名称: " cname
                 cname=$(normalize_service_name "$cname")
                 if [ -n "$cname" ]; then
-                    (docker restart "$cname" 2>/dev/null || (compose stop "$cname" 2>/dev/null && compose up -d "$cname")) && success "$cname 已重启" || error "重启失败"
+                    if (docker restart "$cname" 2>/dev/null || (compose stop "$cname" 2>/dev/null && compose up -d "$cname")); then
+                        success "$cname 已重启"
+                    else
+                        error "服务重启失败，请检查 Docker 日志！"
+                    fi
                 fi
                 pause
                 ;;
@@ -702,7 +763,11 @@ menu_service_control() {
                 read -r -p "请输入要停止的容器名称: " cname
                 cname=$(normalize_service_name "$cname")
                 if [ -n "$cname" ]; then
-                    docker stop "$cname" && success "$cname 已停止" || error "停止失败"
+                    if docker stop "$cname"; then
+                        success "$cname 已停止"
+                    else
+                        error "停止失败，请检查容器状态！"
+                    fi
                 fi
                 pause
                 ;;
@@ -790,8 +855,11 @@ menu_component_selection() {
                 save_env
                 info "正在应用组件配置并重新启动 Docker Compose..."
                 generate_compose
-                compose up -d --remove-orphans
-                success "组件重构与应用完成！"
+                if compose up -d --remove-orphans; then
+                    success "组件重构与应用完成！"
+                else
+                    error "服务启动失败，请检查 Docker 日志或端口占用情况！"
+                fi
                 pause
                 break
                 ;;
@@ -843,11 +911,11 @@ menu_view_logs() {
         *) warn "无效选项" ; sleep 1 ;;
     esac
 
-    trap - INT
     if [ "$log_interrupted" = true ]; then
         info "已退出实时日志跟踪。"
     fi
     pause
+    trap - INT
 }
 
 # ------------------------------------------------------------------------------
@@ -894,8 +962,12 @@ check_host_port_conflict() {
     fi
 
     if [ "$in_use" = true ]; then
-        if [ -n "$svc_cname" ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qw "$svc_cname"; then
-            return 0
+        if [ -n "$svc_cname" ]; then
+            local mapped_ports
+            mapped_ports=$(docker inspect --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}}{{"\n"}}{{end}}{{end}}' "$svc_cname" 2>/dev/null || true)
+            if echo "$mapped_ports" | grep -qx "$port"; then
+                return 0
+            fi
         fi
         return 2
     fi
@@ -919,6 +991,7 @@ menu_network_mode() {
     echo ""
     echo -e " 【模式 B】${RED}0.0.0.0 (公网直开模式)${RESET}"
     echo -e "   - 服务端口直接向全网暴露，任意用户访问 http://服务器公网IP:端口 即可调用；"
+    echo -e "   - ${RED}安全预警: Docker 会默认绕过宿主机 UFW / iptables 防火墙规则，端口将完全无防护直接暴露！${RESET}"
     echo -e "   - 适合临时测试或没有域名的海外云服务器。"
     echo -e "   - ${RED}安全注意: 请务必在各组件配置文件中设置高强度 API Key 与管理员密码！${RESET}"
     echo -e "${CYAN}---------------------------------------------------------------${RESET}"
@@ -934,17 +1007,25 @@ menu_network_mode() {
             save_env
             info "已设置为 127.0.0.1，正在重新生成 Compose 并重启生效..."
             generate_compose
-            compose up -d
-            success "网络模式已切换为 127.0.0.1 (安全双模)！"
+            if compose up -d; then
+                success "网络模式已切换为 127.0.0.1 (安全双模)！"
+            else
+                error "服务启动失败，请检查 Docker 日志或端口占用情况！"
+            fi
             pause
             ;;
         2)
             BIND_IP="0.0.0.0"
             save_env
+            warn "安全警告: Docker 端口映射会直接操作 iptables，默认完全绕过宿主机 UFW / firewalld 防火墙规则！"
+            warn "一旦绑定 0.0.0.0，所有启用的服务端口将直接面向全网暴露，请确保服务均已配置强密码！"
             info "已设置为 0.0.0.0，正在重新生成 Compose 并重启生效..."
             generate_compose
-            compose up -d
-            success "网络模式已切换为 0.0.0.0 (公网暴露)！"
+            if compose up -d; then
+                success "网络模式已切换为 0.0.0.0 (公网暴露)！"
+            else
+                error "服务启动失败，请检查 Docker 日志或端口占用情况！"
+            fi
             pause
             ;;
         3)
@@ -1006,8 +1087,11 @@ menu_network_mode() {
             WORKBUDDY_PORT="$np4"
             save_env
             generate_compose
-            compose up -d
-            success "端口配置已更新并生效！"
+            if compose up -d; then
+                success "端口配置已更新并生效！"
+            else
+                error "服务启动失败，请检查 Docker 日志或端口占用情况！"
+            fi
             pause
             ;;
         0)
@@ -1079,13 +1163,25 @@ menu_swap_manager() {
 
 create_swap() {
     local size_mb="$1"
-    check_root
+    [ "$(id -u)" -eq 0 ] || { error "必须以 root 权限运行创建 Swap！"; return 1; }
 
     info "准备创建 ${size_mb}MB Swap 虚拟内存..."
-    local swap_file="/swapfile"
+    local swap_file="${SWAP_FILE:-/swapfile}"
+
+    # 预检根分区可用磁盘空间 (要求可用空间 >= size_mb + 512MB 应急缓冲)
+    local avail_mb
+    avail_mb=$(df -m / 2>/dev/null | awk 'NR>1 {avail=$(NF-2)} END {print avail}')
+    if [[ "$avail_mb" =~ ^[0-9]+$ ]]; then
+        local req_mb=$(( size_mb + 512 ))
+        if [ "$avail_mb" -lt "$req_mb" ]; then
+            error "根分区磁盘空间不足！当前可用: ${avail_mb}MB，创建 ${size_mb}MB Swap 至少需要 ${req_mb}MB 可用空间（含 512MB 缓冲），已终止创建以防爆盘！"
+            return 1
+        fi
+    fi
 
     # 安全检查：如果当前系统 Swap 正在使用且超过可用物理内存，禁止执行 swapoff (C-3)
-    if [ -f /proc/swaps ] && grep -q "$swap_file" /proc/swaps 2>/dev/null; then
+    local swaps_proc="${SWAPS_PROC:-/proc/swaps}"
+    if [ -f "$swaps_proc" ] && grep -q "$swap_file" "$swaps_proc" 2>/dev/null; then
         local st=0 sf=0 rt=0 rf=0
         read -r rt rf <<< "$(get_ram_info)"
         read -r st sf <<< "$(get_swap_info)"
@@ -1107,17 +1203,28 @@ create_swap() {
     touch "$swap_file" 2>/dev/null || true
     chattr +C "$swap_file" 2>/dev/null || true
 
-    # 尝试使用 fallocate，失败则降级为 dd，兼容无 status=progress 的环境 (H-4)
+    # 分配磁盘空间：优先 fallocate，失败则降级为单次 dd (去除多重 dd 爆盘 bug)
     info "分配磁盘空间 (${size_mb}MB)..."
     if ! fallocate -l "${size_mb}M" "$swap_file" 2>/dev/null; then
-        if ! dd if=/dev/zero of="$swap_file" bs=1M count="$size_mb" status=progress 2>/dev/null; then
-            dd if=/dev/zero of="$swap_file" bs=1M count="$size_mb"
+        if ! dd if=/dev/zero of="$swap_file" bs=1M count="$size_mb" 2>/dev/null; then
+            error "分配磁盘空间失败！"
+            rm -f "$swap_file" 2>/dev/null || true
+            return 1
         fi
     fi
 
     chmod 600 "$swap_file"
-    mkswap "$swap_file"
-    swapon "$swap_file"
+    if ! mkswap "$swap_file" 2>/dev/null; then
+        error "mkswap 格式化 Swap 分区失败！"
+        rm -f "$swap_file" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! swapon "$swap_file" 2>/dev/null; then
+        error "swapon 挂载 Swap 失败！"
+        rm -f "$swap_file" 2>/dev/null || true
+        return 1
+    fi
 
     # 持久化到 /etc/fstab，强制包含 nofail 容灾标记并在写入前备份 (C-4)
     local fstab_file="${FSTAB_FILE:-/etc/fstab}"
@@ -1209,21 +1316,42 @@ menu_channel_guide() {
     echo -e " - ${BOLD}免配置域名${RESET}：无需反代或配置 SSL 证书直接互通。"
     echo -e "${CYAN}----------------------------------------------------------------------${RESET}"
 
-    # 读取各服务配置中的密钥
+    # 读取各服务配置中的密钥与管理凭据
     local grok_key="请在管理后台查看"
+    local grok_admin_pass="请在配置文件中查看"
     local cliproxy_key="动态生成 (在 config.yaml 中查看)"
+    local cliproxy_secret="动态生成 (在 config.yaml 中查看)"
     local workbuddy_key="动态生成 (在 config.json 中查看)"
+
+    if [ -f "$DATA_DIR/grok2api/config.yaml" ]; then
+        local found_gp
+        found_gp=$(grep -E '^[[:space:]]*password:' "$DATA_DIR/grok2api/config.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"' | tr -d "'")
+        [ -n "$found_gp" ] && grok_admin_pass="$found_gp"
+    fi
 
     if [ -f "$DATA_DIR/cliproxy/config.yaml" ]; then
         local found_key
         found_key=$(awk '/api-keys:/ {getline; print $2}' "$DATA_DIR/cliproxy/config.yaml" 2>/dev/null | tr -d '"' | tr -d "'")
         [ -n "$found_key" ] && cliproxy_key="$found_key"
+        local found_sec
+        found_sec=$(grep -E '^[[:space:]]*secret-key:' "$DATA_DIR/cliproxy/config.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"' | tr -d "'")
+        [ -n "$found_sec" ] && cliproxy_secret="$found_sec"
     fi
 
     if [ -f "$DATA_DIR/workbuddy/config.json" ]; then
         local found_wb_key
         found_wb_key=$(grep '"api_key"' "$DATA_DIR/workbuddy/config.json" 2>/dev/null | cut -d '"' -f 4)
         [ -n "$found_wb_key" ] && workbuddy_key="$found_wb_key"
+    fi
+
+    # 0. NewAPI 总控面板卡片
+    if is_service_enabled "newapi"; then
+        echo -e "${BOLD}${CYAN}【NewAPI 核心分发网关与管理后台】${RESET}"
+        echo -e "  - 管理后台 URL: ${YELLOW}http://${host_ip}:${NEWAPI_PORT}${RESET} (本地: http://127.0.0.1:${NEWAPI_PORT})"
+        echo -e "  - 初始管理账号: ${GREEN}root${RESET}"
+        echo -e "  - 初始管理密码: ${WHITE}${NEWAPI_INITIAL_ROOT_PASSWORD:-未生成}${RESET}"
+        echo -e "  - ${YELLOW}提示: 登录后可在【渠道】中添加下方各后端服务。${RESET}"
+        echo ""
     fi
 
     # 1. Grok2API 卡片
@@ -1233,6 +1361,7 @@ menu_channel_guide() {
         echo -e "  - 渠道名称: Grok2API-内网集群"
         echo -e "  - 代理地址 (Base URL): ${YELLOW}http://grok2api:8000${RESET} (宿主机直连: http://${BIND_IP}:${GROK2API_PORT})"
         echo -e "  - 密钥 (Key): ${WHITE}${grok_key}${RESET} (可在后台配置或直接在渠道填入自定义 Token)"
+        echo -e "  - 管理后台: ${CYAN}http://${host_ip}:${GROK2API_PORT}${RESET} (账号: ${GREEN}admin${RESET} / 密码: ${WHITE}${grok_admin_pass}${RESET})"
         echo -e "  - 支持模型填入: ${CYAN}grok-3, grok-3-deepsearch, grok-3-reasoning, grok-2, grok-2-imageGen${RESET}"
         echo ""
     fi
@@ -1243,9 +1372,10 @@ menu_channel_guide() {
         echo -e "  - 渠道类型: ${GREEN}OpenAI${RESET} 或 ${GREEN}Anthropic (按凭据类型选)${RESET}"
         echo -e "  - 渠道名称: CLIProxyAPI-网关"
         echo -e "  - 代理地址 (Base URL): ${YELLOW}http://cli-proxy-api:8317${RESET} (宿主机直连: http://${BIND_IP}:${CLIPROXY_PORT})"
-        echo -e "  - 密钥 (Key): ${WHITE}${cliproxy_key}${RESET}"
+        echo -e "  - 客户端调用密钥 (Key): ${WHITE}${cliproxy_key}${RESET}"
+        echo -e "  - 管理后台地址: ${CYAN}http://${host_ip}:${CLIPROXY_PORT}/management.html${RESET}"
+        echo -e "  - 管理后台 Secret: ${WHITE}${cliproxy_secret}${RESET}"
         echo -e "  - 推荐模型填入: ${CYAN}claude-3-7-sonnet, claude-3-5-sonnet, gpt-4o, o1, gemini-2.5-pro${RESET}"
-        echo -e "  - 管理后台地址: ${DIM}http://${host_ip}:${CLIPROXY_PORT}/management.html${RESET}"
         echo ""
     fi
 
@@ -1349,8 +1479,9 @@ menu_caddy_helper() {
     echo -e "${CYAN}================== [8] 反向代理助手 (Caddy / Caddyfile) ==================${RESET}"
     echo -e " 说明: 本工具自动探测 Caddy 环境，并输出标准 HTTPS 反向代理配置代码块。"
 
+    local caddyfile="${CADDYFILE_PATH:-/etc/caddy/Caddyfile}"
     local has_caddy=false
-    if command -v caddy >/dev/null 2>&1 || [ -f /etc/caddy/Caddyfile ]; then
+    if command -v caddy >/dev/null 2>&1 || [ -f "$caddyfile" ]; then
         has_caddy=true
         echo -e " 宿主机 Caddy 状态: ${GREEN}已安装${RESET}"
     else
@@ -1414,11 +1545,11 @@ workbuddy.${domain} {
     echo "# ==================== aiproxy-box 反向代理块结束 ===================="
     echo -e "${MAGENTA}----------------------------------------------------------------------${RESET}"
 
-    if [ "$has_caddy" = true ] && [ -f /etc/caddy/Caddyfile ]; then
-        read -r -p "是否直接将上述配置写入 /etc/caddy/Caddyfile 并重载 Caddy? (y/N): " append_choice
+    if [ "$has_caddy" = true ] && [ -f "$caddyfile" ]; then
+        read -r -p "是否直接将上述配置写入 $caddyfile 并重载 Caddy? (y/N): " append_choice
         if [[ "$append_choice" =~ ^[Yy]$ ]]; then
-            local bak_file="/etc/caddy/Caddyfile.bak_$(date '+%Y%m%d_%H%M%S')"
-            cp /etc/caddy/Caddyfile "$bak_file" 2>/dev/null || true
+            local bak_file="${caddyfile}.bak_$(date '+%Y%m%d_%H%M%S')"
+            cp "$caddyfile" "$bak_file" 2>/dev/null || true
             info "已备份现有 Caddyfile 到 $bak_file"
 
             local start_tag="# === aiproxy-box auto reverse proxy block start ==="
@@ -1427,18 +1558,22 @@ workbuddy.${domain} {
 ${caddy_blocks}
 ${end_tag}"
 
-            if grep -qF "$start_tag" /etc/caddy/Caddyfile 2>/dev/null && grep -qF "$end_tag" /etc/caddy/Caddyfile 2>/dev/null; then
+            if grep -qF "$start_tag" "$caddyfile" 2>/dev/null && grep -qF "$end_tag" "$caddyfile" 2>/dev/null; then
                 # 清除已有标记块以防止重复生成
-                sed -i "\|$start_tag|,\|$end_tag|d" /etc/caddy/Caddyfile
+                sed -i "\|$start_tag|,\|$end_tag|d" "$caddyfile"
             fi
-            echo "$new_block" >> /etc/caddy/Caddyfile
+            echo "$new_block" >> "$caddyfile"
 
-            if caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
-                caddy reload --config /etc/caddy/Caddyfile 2>/dev/null && success "已更新配置并平滑重载 Caddy！" || warn "配置已写入，但重载需要手动执行: caddy reload"
+            if caddy validate --config "$caddyfile" 2>/dev/null; then
+                caddy reload --config "$caddyfile" 2>/dev/null && success "已更新配置并平滑重载 Caddy！" || warn "配置已写入，但重载需要手动执行: caddy reload"
             else
-                warn "检测到 Caddy 语法校验未通过，正在自动回滚..."
-                cp "$bak_file" /etc/caddy/Caddyfile 2>/dev/null || true
-                error "配置写入已回滚，请检查域名或已有 site block 冲突！"
+                if command -v caddy >/dev/null 2>&1; then
+                    warn "检测到 Caddy 语法校验未通过，正在自动回滚..."
+                    cp "$bak_file" "$caddyfile" 2>/dev/null || true
+                    error "配置写入已回滚，请检查域名或已有 site block 冲突！"
+                else
+                    success "已成功将反代配置写入 $caddyfile！"
+                fi
             fi
         fi
     fi
@@ -1453,10 +1588,18 @@ menu_update_images() {
     echo -e "${CYAN}================== [9] 服务镜像更新与平滑重建 ==================${RESET}"
     info "正在拉取各个启用的最新 Docker 镜像..."
     generate_compose
-    compose pull
+    if ! compose pull; then
+        error "服务镜像拉取失败，请检查 Docker 或网络连通性！"
+        pause
+        return 1
+    fi
     info "正在平滑重建容器..."
-    compose up -d
-    success "全部服务镜像更新并重启完毕！"
+    if compose up -d; then
+        docker image prune -f 2>/dev/null || true
+        success "全部服务镜像更新并重启完毕！已自动清理未使用的旧镜像。"
+    else
+        error "服务启动失败，请检查 Docker 日志或端口占用情况！"
+    fi
     pause
 }
 
@@ -1482,13 +1625,11 @@ menu_backup() {
     fi
 
     # 排除大体积临时日志，仅备份配置和关键数据
-    tar -czf "$APP_DIR/$backup_name" \
+    if tar -czf "$APP_DIR/$backup_name" \
         -C "$APP_DIR" \
         --exclude="*.log" \
         --exclude="*.tar.gz" \
-        "${items[@]}" 2>/dev/null
-
-    if [ -f "$APP_DIR/$backup_name" ]; then
+        "${items[@]}" 2>/dev/null && [ -f "$APP_DIR/$backup_name" ]; then
         chmod 600 "$APP_DIR/$backup_name" 2>/dev/null || true
         local bsize
         bsize=$(du -h "$APP_DIR/$backup_name" | awk '{print $1}')
@@ -1545,18 +1686,25 @@ menu_uninstall() {
     rm -f "/usr/local/bin/aiproxy"
     success "aiproxy-box 容器与快捷方式卸载完成！"
 
-    if [ -d "$APP_DIR" ]; then
-        read -r -p "是否清理项目主程序目录 ($APP_DIR)？(y/N): " rm_dir
-        if [[ "$rm_dir" =~ ^[Yy]$ ]]; then
-            if [[ "$rm_data" =~ ^[Yy]$ ]]; then
-                info "正在清理 $APP_DIR ..."
-                ( sleep 1 && rm -rf "$APP_DIR" ) >/dev/null 2>&1 &
-            else
-                info "保留 $DATA_DIR，正在清理其余程序与模板文件..."
-                ( sleep 1 && find "$APP_DIR" -maxdepth 1 ! -name "data" ! -name "." ! -name ".." -exec rm -rf {} + ) >/dev/null 2>&1 &
-                info "数据目录已完好保留在: $DATA_DIR"
-            fi
-        fi
+    read -r -p "是否清理项目主程序目录 ($APP_DIR)？(y/N): " rm_dir
+    if [[ "$rm_dir" =~ ^[Yy]$ ]]; then
+        case "$APP_DIR" in
+            ""|"/"|"/root"|"/home"|"/usr"|"/etc"|"/var"|"/bin")
+                error "安全拦截：APP_DIR ($APP_DIR) 为系统关键目录，禁止递归删除！"
+                ;;
+            *)
+                if [ -d "$APP_DIR" ]; then
+                    if [[ "$rm_data" =~ ^[Yy]$ ]]; then
+                        info "正在清理 $APP_DIR ..."
+                        ( sleep 1 && rm -rf "$APP_DIR" ) >/dev/null 2>&1 &
+                    else
+                        info "保留 $DATA_DIR，正在清理其余程序与模板文件..."
+                        ( sleep 1 && find "$APP_DIR" -maxdepth 1 ! -name "data" ! -name "." ! -name ".." -exec rm -rf {} + ) >/dev/null 2>&1 &
+                        info "数据目录已完好保留在: $DATA_DIR"
+                    fi
+                fi
+                ;;
+        esac
     fi
     success "卸载操作已结束。"
     exit 0
@@ -1567,7 +1715,18 @@ menu_uninstall() {
 # ------------------------------------------------------------------------------
 main_menu() {
     ensure_initialized
+    local dk_stat=0
+    check_docker || dk_stat=$?
+    if [ "$dk_stat" -eq 1 ]; then
+        warn "未检测到 Docker 或 Docker Compose！"
+        read -r -p "是否立即自动安装 Docker 运行时环境？(y/N): " inst_dk
+        if [[ "$inst_dk" =~ ^[Yy]$ ]]; then
+            install_docker
+        fi
+    fi
+
     while true; do
+        clear 2>/dev/null || echo ""
         # 捕获 Ctrl+C 防止意外退出主循环，在每次循环迭代重新生效 (M-5)
         trap 'echo ""; echo -e "\n${GREEN}[INFO] 如需退出 aiproxy 控制台，请输入 0 回车。${RESET}"' INT
         print_header
@@ -1636,29 +1795,59 @@ cli_dispatch() {
             if [ -n "$2" ]; then
                 local target
                 target=$(normalize_service_name "$2")
-                docker start "$target" 2>/dev/null || compose up -d "$target"
+                if docker start "$target" 2>/dev/null || compose up -d "$target"; then
+                    success "服务 $target 启动成功！"
+                else
+                    error "服务 $target 启动失败，请检查 Docker 日志或端口占用情况！"
+                    return 1
+                fi
             else
                 generate_compose
-                compose up -d
+                if compose up -d; then
+                    success "全部服务启动成功！"
+                else
+                    error "服务启动失败，请检查 Docker 日志或端口占用情况！"
+                    return 1
+                fi
             fi
             ;;
         stop)
             if [ -n "$2" ]; then
                 local target
                 target=$(normalize_service_name "$2")
-                docker stop "$target"
+                if docker stop "$target"; then
+                    success "服务 $target 已停止！"
+                else
+                    error "服务 $target 停止失败！"
+                    return 1
+                fi
             else
-                compose down
+                if compose down; then
+                    success "所有服务已停止！"
+                else
+                    error "服务停止失败！"
+                    return 1
+                fi
             fi
             ;;
         restart)
             if [ -n "$2" ]; then
                 local target
                 target=$(normalize_service_name "$2")
-                docker restart "$target" 2>/dev/null || (compose stop "$target" && compose up -d "$target")
+                if docker restart "$target" 2>/dev/null || (compose stop "$target" && compose up -d "$target"); then
+                    success "服务 $target 重启成功！"
+                else
+                    error "服务 $target 重启失败！"
+                    return 1
+                fi
             else
                 generate_compose
-                compose restart
+                if compose restart; then
+                    success "全部服务重启成功！"
+                else
+                    error "服务重启失败！"
+                    return 1
+                fi
             fi
             ;;
         logs)
@@ -1672,7 +1861,17 @@ cli_dispatch() {
             ;;
         update)
             generate_compose
-            compose pull && compose up -d
+            if ! compose pull; then
+                error "服务镜像拉取失败！"
+                return 1
+            fi
+            if compose up -d; then
+                docker image prune -f 2>/dev/null || true
+                success "服务镜像更新并平滑重建完毕！"
+            else
+                error "服务启动失败，请检查 Docker 日志或端口占用情况！"
+                return 1
+            fi
             ;;
         backup)
             menu_backup

@@ -2,7 +2,7 @@
 # ==============================================================================
 # aiproxy-box 一键在线安装脚本
 # 支持 Debian / Ubuntu / CentOS / Rocky / AlmaLinux / Alpine 等主流 Linux 系统
-# 用法: curl -fsSL https://raw.githubusercontent.com/aiproxy-box/aiproxy-box/main/install.sh | bash
+# 用法: curl -fsSL https://raw.githubusercontent.com/DongHua3/aiproxy-box/main/install.sh | bash
 # ==============================================================================
 
 set -e
@@ -17,8 +17,8 @@ BOLD="\033[1m"
 RESET="\033[0m"
 
 INSTALL_DIR="/opt/aiproxy-box"
-REPO_URL="https://github.com/aiproxy-box/aiproxy-box.git"
-REPO_ARCHIVE="https://github.com/aiproxy-box/aiproxy-box/archive/refs/heads/main.tar.gz"
+REPO_URL="https://github.com/DongHua3/aiproxy-box.git"
+REPO_ARCHIVE="https://github.com/DongHua3/aiproxy-box/archive/refs/heads/main.tar.gz"
 
 echo -e "${CYAN}======================================================================${RESET}"
 echo -e "${BOLD}${CYAN}            aiproxy-box (AI 代理全能工具箱) 一键安装程序             ${RESET}"
@@ -107,6 +107,10 @@ fi
 
 # 5. 配置快捷命令与初始化权限
 echo -e "${CYAN}[4/5] 正在配置执行权限与全局软链接 /usr/local/bin/aiproxy ...${RESET}"
+if [ ! -f "$INSTALL_DIR/aiproxy.sh" ]; then
+    echo -e "${RED}[ERROR] 未能在 ${INSTALL_DIR} 找到 aiproxy.sh，下载或代码克隆失败，请检查网络连接或权限！${RESET}"
+    exit 1
+fi
 chmod +x "$INSTALL_DIR/aiproxy.sh"
 ln -sf "$INSTALL_DIR/aiproxy.sh" /usr/local/bin/aiproxy
 

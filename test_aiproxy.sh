@@ -67,7 +67,7 @@ echo "[Test 3] 测试全量 4 服务动态 Compose 生成..."
     fi
 
     # Verify services in compose
-    for s in "new-api" "grok2api" "cli-proxy-api" "workbuddy2api" "aiproxy-net" 'max-size: "20m"'; do
+    for s in "new-api" "grok2api" "cli-proxy-api" "workbuddy2api" "aiproxy-net" 'max-size: "20m"' "version: '3.8'" 'INITIAL_ROOT_PASSWORD'; do
         if grep -q "$s" docker-compose.yml; then
             echo "✓ 包含关键配置项: $s"
         else
@@ -79,13 +79,14 @@ echo "[Test 3] 测试全量 4 服务动态 Compose 生成..."
 echo "✓ Test 3 通过"
 
 # Test 4: PyYAML validation on generated docker-compose.yml
-echo "[Test 4] 校验生成的 Compose 文件 YAML 语法合法性..."
+echo "[Test 4] 校验生成的 Compose 文件 YAML 语法合法性与版本规范..."
 PYTHONIOENCODING=utf-8 python -c "
 import yaml
 with open('test_env/docker-compose.yml', 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f)
 assert 'services' in data, 'Missing services in YAML'
 assert 'networks' in data, 'Missing networks in YAML'
+assert data.get('version') == '3.8', 'Missing or invalid Compose version'
 assert 'new-api' in data['services'], 'Missing new-api service'
 assert 'grok2api' in data['services'], 'Missing grok2api service'
 assert 'cli-proxy-api' in data['services'], 'Missing cli-proxy-api service'
@@ -301,24 +302,39 @@ for f in aiproxy.sh install.sh test_aiproxy.sh; do
 done
 echo "✓ Test 14 通过"
 
-# Test 15: fstab nofail, backup, and delete_swap entry cleanup (C-4)
-echo "[Test 15] 测试 /etc/fstab 包含 nofail 标记、备份机制与 delete_swap 残留清理 (C-4)..."
+# Test 15: fstab nofail, backup, and delete_swap entry cleanup (C-4, BUG-H01)
+echo "[Test 15] 测试 create_swap 与 delete_swap 真实逻辑及 /etc/fstab nofail 容灾标记 (C-4, BUG-H01)..."
 (
     cd test_env
     source aiproxy.sh
-    check_root() { return 0; }
     export FSTAB_FILE="mock_fstab"
-    export SWAP_FILE="/swapfile"
+    export SWAP_FILE="$PWD/test_swapfile"
+    rm -f "$FSTAB_FILE" "${FSTAB_FILE}".bak_* "$SWAP_FILE"
+    touch "$FSTAB_FILE"
 
-    # 1. 验证旧格式 fstab 正确清理并规范写入 defaults,nofail
-    echo "# original fstab" > "$FSTAB_FILE"
-    echo "$SWAP_FILE none swap sw 0 0" >> "$FSTAB_FILE"
-
-    if [ -f "$FSTAB_FILE" ]; then
-        cp "$FSTAB_FILE" "${FSTAB_FILE}.bak_test" 2>/dev/null || true
-        sed -i "\|$SWAP_FILE[[:space:]]|d" "$FSTAB_FILE" 2>/dev/null || true
-        echo "$SWAP_FILE swap swap defaults,nofail 0 0" >> "$FSTAB_FILE"
+    # 1. 验证非 root 权限拦截
+    id() {
+        if [ "$1" = "-u" ]; then echo "1000"; else command id "$@"; fi
+    }
+    ret_non_root=0
+    create_swap 1024 >/dev/null 2>&1 || ret_non_root=$?
+    if [ "$ret_non_root" -eq 1 ]; then
+        echo "✓ create_swap 成功拦截非 root 用户执行"
+    else
+        echo "✗ create_swap 未能拦截非 root 用户"
+        exit 1
     fi
+
+    # 2. 模拟 root 环境并直接调用真实 create_swap 函数
+    id() {
+        if [ "$1" = "-u" ]; then echo "0"; else command id "$@"; fi
+    }
+    fallocate() { touch "$SWAP_FILE"; return 0; }
+    mkswap() { return 0; }
+    swapon() { return 0; }
+    tune_swappiness() { return 0; }
+
+    create_swap 1024
 
     if grep -q "$SWAP_FILE swap swap defaults,nofail 0 0" "$FSTAB_FILE"; then
         echo "✓ /etc/fstab 成功写入 defaults,nofail 容灾标记"
@@ -326,11 +342,19 @@ echo "[Test 15] 测试 /etc/fstab 包含 nofail 标记、备份机制与 delete_
         echo "✗ /etc/fstab 缺少 defaults,nofail 标记"
         exit 1
     fi
-    [ -f "${FSTAB_FILE}.bak_test" ] || { echo "✗ /etc/fstab 备份未生成"; exit 1; }
 
-    # 2. 调用真实的 delete_swap 函数测试残留条目清理
+    bak_cnt=$(ls -1 "${FSTAB_FILE}".bak_* 2>/dev/null | wc -l)
+    if [ "$bak_cnt" -ge 1 ]; then
+        echo "✓ /etc/fstab 备份机制生效"
+    else
+        echo "✗ /etc/fstab 备份未生成"
+        exit 1
+    fi
+
+    # 3. 直接调用真实 delete_swap 函数测试残留条目清理
     get_ram_info() { echo "4096 3072"; }
     get_swap_info() { echo "1024 1024"; }
+    swapoff() { return 0; }
     delete_swap
 
     if grep -q "$SWAP_FILE" "$FSTAB_FILE"; then
@@ -339,7 +363,7 @@ echo "[Test 15] 测试 /etc/fstab 包含 nofail 标记、备份机制与 delete_
     else
         echo "✓ /etc/fstab 残留条目成功清理"
     fi
-    rm -f "$FSTAB_FILE" "${FSTAB_FILE}"*
+    rm -f "$FSTAB_FILE" "${FSTAB_FILE}"* "$SWAP_FILE"
 )
 echo "✓ Test 15 通过"
 
@@ -426,6 +450,14 @@ echo "[Test 17] 校验全量核心服务密钥动态随机生成 (C-1)..."
         echo "✗ Grok2API 管理员密码未正确随机化: $grok_pass"
         exit 1
     fi
+
+    # NewAPI initial root password (BUG-H02)
+    if [ -n "$NEWAPI_INITIAL_ROOT_PASSWORD" ] && [[ "$NEWAPI_INITIAL_ROOT_PASSWORD" =~ ^[a-f0-9]{32}$ ]]; then
+        echo "✓ NewAPI 动态随机初始密码生成有效: $NEWAPI_INITIAL_ROOT_PASSWORD"
+    else
+        echo "✗ NewAPI 初始密码未正确随机化: $NEWAPI_INITIAL_ROOT_PASSWORD"
+        exit 1
+    fi
 )
 echo "✓ Test 17 通过"
 
@@ -464,25 +496,55 @@ echo "[Test 19] 测试 CLI 与交互服务别名规范化映射 (normalize_servi
 )
 echo "✓ Test 19 通过"
 
-# Test 20: Port conflict capture logic (H-5)
-echo "[Test 20] 测试 check_host_port_conflict 退出码捕获逻辑 (H-5)..."
+# Test 20: Port conflict capture logic (H-5, BUG-C02)
+echo "[Test 20] 测试 check_host_port_conflict 真实端口冲突与自身容器排除判定 (H-5, BUG-C02)..."
 (
     cd test_env
     source aiproxy.sh
 
-    check_host_port_conflict() {
-        return 2
+    # 1. 格式无效端口返回 1
+    ret_inv=0
+    check_host_port_conflict "invalid_port" "new-api" || ret_inv=$?
+    [ "$ret_inv" -eq 1 ] || { echo "✗ 无效端口未返回 1: $ret_inv"; exit 1; }
+
+    # 2. 未被占用的端口返回 0
+    ss() { echo ""; }
+    netstat() { echo ""; }
+    lsof() { echo ""; }
+    ret_free=0
+    check_host_port_conflict "3000" "new-api" || ret_free=$?
+    [ "$ret_free" -eq 0 ] || { echo "✗ 空闲端口未返回 0: $ret_free"; exit 1; }
+
+    # 3. 端口被第三方外部进程占用 (非目标容器)，必须返回 2 警告冲突 (BUG-C02)
+    ss() { echo "tcp LISTEN 0 128 0.0.0.0:3000 0.0.0.0:*"; }
+    docker() {
+        if [ "$1" = "inspect" ]; then
+            # 目标容器 new-api 实际上只映射了 8080 和 9000，并未绑定 3000
+            printf "8080\n9000\n"
+        fi
     }
-
-    warn_msg=""
-    ret=0
-    ret=0; check_host_port_conflict "3000" "new-api" || ret=$?
-    [ "$ret" -eq 2 ] && warn_msg="NewAPI 端口 3000"
-
-    if [ "$warn_msg" = "NewAPI 端口 3000" ]; then
-        echo "✓ 成功消除管道取反 bug，精确捕获 ret=2 端口占用警告"
+    ret_conflict=0
+    check_host_port_conflict "3000" "new-api" || ret_conflict=$?
+    if [ "$ret_conflict" -eq 2 ]; then
+        echo "✓ 成功检测到第三方外部进程占用 (返回 2)"
     else
-        echo "✗ 端口占用退出码捕获失败: warn_msg='$warn_msg'"
+        echo "✗ 端口占用检测倒置失败，未能返回 2: $ret_conflict"
+        exit 1
+    fi
+
+    # 4. 端口被该服务自身容器绑定占用，精确判定为自身占用 (返回 0，非外部冲突)
+    ss() { echo "tcp LISTEN 0 128 0.0.0.0:3000 0.0.0.0:*"; }
+    docker() {
+        if [ "$1" = "inspect" ]; then
+            printf "8080\n3000\n9000\n"
+        fi
+    }
+    ret_self=0
+    check_host_port_conflict "3000" "new-api" || ret_self=$?
+    if [ "$ret_self" -eq 0 ]; then
+        echo "✓ 目标容器自身绑定的端口精确放行 (返回 0)"
+    else
+        echo "✗ 目标容器自身绑定的端口被误判为冲突: $ret_self"
         exit 1
     fi
 )
@@ -514,37 +576,33 @@ echo "[Test 21] 测试 ensure_host_ip 在当前 Shell 上下文中持久化缓�
 echo "✓ Test 21 通过"
 
 # Test 22: Caddy helper anti-duplicate site blocks (M-3)
-echo "[Test 22] 测试 Caddy 助手专有标记块识别与防重复生成 (M-3)..."
+echo "[Test 22] 测试真实调用 menu_caddy_helper 标记块生成与防重复机制 (M-3)..."
 (
     cd test_env
-    mock_caddyfile="test_caddyfile"
+    source aiproxy.sh
+    export CADDYFILE_PATH="$PWD/test_caddyfile"
+    export ENABLED_SERVICES="newapi"
+    export NEWAPI_PORT="3000"
+    save_env
+    echo "# existing host sites" > "$CADDYFILE_PATH"
+
+    # 首次调用 menu_caddy_helper 注入配置
+    printf "example.com\ny\n\n" | menu_caddy_helper >/dev/null 2>&1
+
+    # 修改端口并再次调用 menu_caddy_helper，验证标记块直接被原子替换而非重复追加
+    export NEWAPI_PORT="3001"
+    save_env
+    printf "example.com\ny\n\n" | menu_caddy_helper >/dev/null 2>&1
+
     start_tag="# === aiproxy-box auto reverse proxy block start ==="
-    end_tag="# === aiproxy-box auto reverse proxy block end ==="
-
-    echo "# existing host sites" > "$mock_caddyfile"
-    echo "site1.example.com { reverse_proxy localhost:8080 }" >> "$mock_caddyfile"
-
-    block1="${start_tag}
-api.example.com { reverse_proxy 127.0.0.1:3000 }
-${end_tag}"
-    echo "$block1" >> "$mock_caddyfile"
-
-    block2="${start_tag}
-api.example.com { reverse_proxy 127.0.0.1:3001 }
-${end_tag}"
-    if grep -qF "$start_tag" "$mock_caddyfile"; then
-        sed -i "\|$start_tag|,\|$end_tag|d" "$mock_caddyfile"
-    fi
-    echo "$block2" >> "$mock_caddyfile"
-
-    count=$(grep -c "$start_tag" "$mock_caddyfile" || true)
-    if [ "$count" -eq 1 ] && grep -q "3001" "$mock_caddyfile" && ! grep -q "3000" "$mock_caddyfile"; then
-        echo "✓ Caddy 标记块精准替换，成功防止重复 site block 导致 Caddy 崩溃"
+    count=$(grep -c "$start_tag" "$CADDYFILE_PATH" || true)
+    if [ "$count" -eq 1 ] && grep -q "3001" "$CADDYFILE_PATH" && ! grep -q "3000" "$CADDYFILE_PATH"; then
+        echo "✓ 真实调用 menu_caddy_helper，Caddy 标记块精准替换，成功防止重复 site block 导致 Caddy 崩溃"
     else
         echo "✗ Caddy 标记块处理异常: 匹配次数=$count"
         exit 1
     fi
-    rm -f "$mock_caddyfile"
+    rm -f "$CADDYFILE_PATH" "${CADDYFILE_PATH}".bak_*
 )
 echo "✓ Test 22 通过"
 
@@ -554,21 +612,25 @@ echo "[Test 23] 测试灾备归档包完整包含 aiproxy.sh 与 install.sh (H-3
     cd test_env
     cp ../install.sh .
     source aiproxy.sh
-    backup_name="test-backup.tar.gz"
-    items=()
-    for f in data .env templates docker-compose.yml aiproxy.sh install.sh; do
-        [ -e "$f" ] && items+=("$f")
-    done
-    tar -czf "$backup_name" "${items[@]}" 2>/dev/null
+    export APP_DIR="$PWD"
+    touch .env docker-compose.yml
+    # 调用真实 menu_backup 函数
+    printf "\n" | menu_backup >/dev/null 2>&1
 
-    content=$(tar -tzf "$backup_name")
-    if echo "$content" | grep -q "aiproxy.sh" && echo "$content" | grep -q "install.sh"; then
-        echo "✓ 备份归档包完整包含主控脚本 aiproxy.sh 与 install.sh"
+    backup_file=$(ls -t aiproxy-box-backup-*.tar.gz 2>/dev/null | head -n 1)
+    if [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
+        content=$(tar -tzf "$backup_file")
+        if echo "$content" | grep -q "aiproxy.sh" && echo "$content" | grep -q "install.sh"; then
+            echo "✓ 真实调用 menu_backup，备份归档包完整包含主控脚本 aiproxy.sh 与 install.sh"
+        else
+            echo "✗ 备份归档包遗漏了关键脚本: $content"
+            exit 1
+        fi
+        rm -f "$backup_file" install.sh
     else
-        echo "✗ 备份归档包遗漏了关键脚本"
+        echo "✗ menu_backup 未能成功生成归档文件"
         exit 1
     fi
-    rm -f "$backup_name" install.sh
 )
 echo "✓ Test 23 通过"
 
@@ -694,9 +756,106 @@ echo "[Test 30] 测试 main_menu 输入流 EOF 优雅退出（防止管道无限
 )
 echo "✓ Test 30 通过"
 
+# Test 31: check_docker daemon liveness and return codes (BUG-H05)
+echo "[Test 31] 测试 check_docker 守护进程探针与状态码判定 (BUG-H05)..."
+(
+    cd test_env
+    source aiproxy.sh
+    get_compose_cmd() { echo "docker compose"; }
+
+    # Case A: dockerd is healthy (docker info returns 0)
+    docker() { if [ "$1" = "info" ]; then return 0; fi; }
+    res=0
+    check_docker || res=$?
+    [ "$res" -eq 0 ] || { echo "✗ dockerd 正常时未返回 0: $res"; exit 1; }
+
+    # Case B: dockerd is down (docker info returns 1)
+    docker() { if [ "$1" = "info" ]; then return 1; fi; }
+    res=0
+    check_docker || res=$?
+    if [ "$res" -eq 2 ]; then
+        echo "✓ dockerd 宕机时精确返回状态码 2 (BUG-H05)"
+    else
+        echo "✗ dockerd 宕机时未返回 2: $res"
+        exit 1
+    fi
+)
+echo "✓ Test 31 通过"
+
+# Test 32: menu_uninstall critical path protection (BUG-H06)
+echo "[Test 32] 测试 menu_uninstall 核心系统目录安全拦截保护 (BUG-H06)..."
+(
+    cd test_env
+    source aiproxy.sh
+    compose() { return 0; }
+
+    for dangerous_path in "/" "/root" "/home" "/usr" "/etc" "/var" "/bin"; do
+        APP_DIR="$dangerous_path"
+        out=$(printf "y\ny\ny\n" | menu_uninstall 2>&1 || true)
+        if echo "$out" | grep -q "安全拦截：APP_DIR ($dangerous_path) 为系统关键目录，禁止递归删除！"; then
+            continue
+        else
+            echo "✗ 关键路径 $dangerous_path 未触发安全拦截: $out"
+            exit 1
+        fi
+    done
+    echo "✓ 成功拦截所有 7 个系统关键目录的意外递归删除"
+)
+echo "✓ Test 32 通过"
+
+# Test 33: WorkBuddy2API permissions chmod 644 and 775 (BUG-H04)
+echo "[Test 33] 测试 WorkBuddy2API 挂载文件权限规范 (BUG-H04)..."
+(
+    cd test_env
+    source aiproxy.sh
+    rm -rf data/workbuddy
+    init_service_configs
+
+    [ -f "data/workbuddy/config.json" ] || { echo "✗ config.json 未生成"; exit 1; }
+    [ -d "data/workbuddy/auths" ] || { echo "✗ auths 目录未生成"; exit 1; }
+    [ -d "data/workbuddy/data" ] || { echo "✗ data 目录未生成"; exit 1; }
+
+    if grep -q 'chmod 644 "\$DATA_DIR/workbuddy/config.json"' aiproxy.sh && \
+       grep -q 'chmod 775 "\$DATA_DIR/workbuddy/auths" "\$DATA_DIR/workbuddy/data"' aiproxy.sh; then
+        echo "✓ WorkBuddy2API 配置 644 (:ro) 与数据 775 (:rw) 权限规则正确设置"
+    else
+        echo "✗ WorkBuddy2API 权限设置不符合 BUG-H04 规范"
+        exit 1
+    fi
+)
+echo "✓ Test 33 通过"
+
+# Test 34: Docker / Compose execution exit code verification (BUG-C03)
+echo "[Test 34] 测试 Docker 与 Compose 失败时拦截假成功 (BUG-C03)..."
+(
+    cd test_env
+    source aiproxy.sh
+    compose() { return 1; }
+    docker() { return 1; }
+
+    ret_start=0
+    out_start=$(cli_dispatch start 2>&1) || ret_start=$?
+    if [ "$ret_start" -eq 1 ] && echo "$out_start" | grep -q "服务启动失败"; then
+        echo "✓ cli_dispatch start 失败时精确捕获非零退出码并拦截假成功"
+    else
+        echo "✗ cli_dispatch start 失败捕获异常: ret=$ret_start, out=$out_start"
+        exit 1
+    fi
+
+    ret_stop=0
+    out_stop=$(cli_dispatch stop newapi 2>&1) || ret_stop=$?
+    if [ "$ret_stop" -eq 1 ] && echo "$out_stop" | grep -q "停止失败"; then
+        echo "✓ cli_dispatch stop 失败时精确捕获非零退出码并拦截假成功"
+    else
+        echo "✗ cli_dispatch stop 失败捕获异常: ret=$ret_stop, out=$out_stop"
+        exit 1
+    fi
+)
+echo "✓ Test 34 通过"
+
 # Clean test_env
 rm -rf test_env
 
 echo "=========================================="
-echo "🎉 全部 30 项自动化深度测试（含架构修复、密码学、SELinux 与系统可靠性）全部通过！"
+echo "🎉 全部 34 项自动化深度测试（含架构修复、密码学、SELinux、真实逻辑与系统可靠性）全部通过！"
 echo "=========================================="

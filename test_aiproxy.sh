@@ -306,50 +306,81 @@ echo "[Test 15] 测试 /etc/fstab 包含 nofail 标记、备份机制与 delete_
 (
     cd test_env
     source aiproxy.sh
-    mock_fstab="mock_fstab"
-    echo "# original fstab" > "$mock_fstab"
+    check_root() { return 0; }
+    export FSTAB_FILE="mock_fstab"
+    export SWAP_FILE="/swapfile"
 
-    swap_file="/swapfile"
-    if ! grep -q "$swap_file" "$mock_fstab"; then
-        cp "$mock_fstab" "${mock_fstab}.bak"
-        echo "$swap_file swap swap defaults,nofail 0 0" >> "$mock_fstab"
+    # 1. 验证旧格式 fstab 正确清理并规范写入 defaults,nofail
+    echo "# original fstab" > "$FSTAB_FILE"
+    echo "$SWAP_FILE none swap sw 0 0" >> "$FSTAB_FILE"
+
+    if [ -f "$FSTAB_FILE" ]; then
+        cp "$FSTAB_FILE" "${FSTAB_FILE}.bak_test" 2>/dev/null || true
+        sed -i "\|$SWAP_FILE[[:space:]]|d" "$FSTAB_FILE" 2>/dev/null || true
+        echo "$SWAP_FILE swap swap defaults,nofail 0 0" >> "$FSTAB_FILE"
     fi
-    if grep -q "$swap_file swap swap defaults,nofail 0 0" "$mock_fstab"; then
+
+    if grep -q "$SWAP_FILE swap swap defaults,nofail 0 0" "$FSTAB_FILE"; then
         echo "✓ /etc/fstab 成功写入 defaults,nofail 容灾标记"
     else
         echo "✗ /etc/fstab 缺少 defaults,nofail 标记"
         exit 1
     fi
-    [ -f "${mock_fstab}.bak" ] || { echo "✗ /etc/fstab 备份未生成"; exit 1; }
+    [ -f "${FSTAB_FILE}.bak_test" ] || { echo "✗ /etc/fstab 备份未生成"; exit 1; }
 
-    sed -i "\|$swap_file[[:space:]]|d" "$mock_fstab"
-    if grep -q "$swap_file" "$mock_fstab"; then
+    # 2. 调用真实的 delete_swap 函数测试残留条目清理
+    get_ram_info() { echo "4096 3072"; }
+    get_swap_info() { echo "1024 1024"; }
+    delete_swap
+
+    if grep -q "$SWAP_FILE" "$FSTAB_FILE"; then
         echo "✗ 残留 Swap 挂载项清理失败"
         exit 1
     else
         echo "✓ /etc/fstab 残留条目成功清理"
     fi
-    rm -f "$mock_fstab" "${mock_fstab}.bak"
+    rm -f "$FSTAB_FILE" "${FSTAB_FILE}"*
 )
 echo "✓ Test 15 通过"
 
 # Test 16: Safe swap creation & delete OOM check (C-3)
-echo "[Test 16] 测试 Swap 管理低物理内存 OOM 安全拦截 (C-3)..."
+echo "[Test 16] 测试 Swap 管理低物理内存 OOM 安全拦截与 fstab 保护 (C-3)..."
 (
     cd test_env
     source aiproxy.sh
-    get_ram_info() { echo "1024 512"; }
+    check_root() { return 0; }
+    export FSTAB_FILE="mock_fstab_oom"
+    export SWAP_FILE="/swapfile_oom"
+    export SWAPS_PROC="mock_swaps"
+
+    # 构造挂载中的 fstab 与活跃状态的 swaps
+    echo "$SWAP_FILE swap swap defaults,nofail 0 0" > "$FSTAB_FILE"
+    echo "Filename Type Size Used Priority" > "$SWAPS_PROC"
+    echo "$SWAP_FILE file 2097152 1572864 -2" >> "$SWAPS_PROC"
+
+    # 模拟低内存高 Swap 占用：已使用 Swap 1536MB，可用内存仅 256MB
+    get_ram_info() { echo "1024 256"; }
     get_swap_info() { echo "2048 512"; }
 
-    read -r rt rf <<< "$(get_ram_info)"
-    read -r st sf <<< "$(get_swap_info)"
-    su=$(( st - sf ))
-    if [ "$su" -gt 0 ] && [ "$su" -ge "$rf" ]; then
-        echo "✓ 成功触发 OOM 安全拦截 (已用 Swap ${su}MB >= 可用内存 ${rf}MB)"
+    # 直接调用真实的 delete_swap 函数测试安全拦截
+    ret=0
+    delete_swap || ret=$?
+
+    if [ "$ret" -eq 1 ]; then
+        echo "✓ 成功触发 OOM 安全拦截 (已用 Swap 1536MB >= 可用内存 256MB)"
     else
-        echo "✗ 未能正确触发安全拦截"
+        echo "✗ 未能正确触发安全拦截: ret=$ret"
         exit 1
     fi
+
+    # 确保在拦截时 fstab 绝对未被误删
+    if grep -q "$SWAP_FILE" "$FSTAB_FILE"; then
+        echo "✓ OOM 拦截成功保护 /etc/fstab 配置未被提前误删"
+    else
+        echo "✗ OOM 拦截失败，/etc/fstab 配置被破坏"
+        exit 1
+    fi
+    rm -f "$FSTAB_FILE" "${FSTAB_FILE}"* "$SWAPS_PROC"
 )
 echo "✓ Test 16 通过"
 
@@ -557,9 +588,115 @@ else
 fi
 echo "✓ Test 24 通过"
 
+# Test 25: CLI status command execution & ANSI formatting
+echo "[Test 25] 测试 CLI aiproxy status 执行及看板渲染 (print_header)..."
+(
+    output=$(bash aiproxy.sh status)
+    if echo "$output" | grep -q "组件运行状态概览" && echo "$output" | grep -q "NewAPI"; then
+        echo "✓ aiproxy status 执行成功，看板渲染正常"
+    else
+        echo "✗ aiproxy status 输出异常"
+        exit 1
+    fi
+    if echo "$output" | grep -q "print_heade: command not found"; then
+        echo "✗ 检测到 print_heade 拼写错误"
+        exit 1
+    fi
+    if echo "$output" | grep -q '\\033\['; then
+        echo "✗ 检测到未解析的原始 ANSI 转义串"
+        exit 1
+    fi
+    echo "✓ aiproxy status 无拼写错误且 ANSI 格式化解析正确"
+)
+echo "✓ Test 25 通过"
+
+# Test 26: CLI service aliases normalization in CLI actions (M-8)
+echo "[Test 26] 测试 CLI 启动/停止/重启/日志别名映射完整性 (M-8)..."
+(
+    cd test_env
+    source aiproxy.sh
+    docker() {
+        echo "docker_called:$*"
+    }
+    compose() {
+        echo "compose_called:$*"
+    }
+
+    res_start=$(cli_dispatch start cliproxy 2>&1 || true)
+    if echo "$res_start" | grep -q "docker_called:start cli-proxy-api"; then
+        echo "✓ cli_dispatch start cliproxy 正确转换为 cli-proxy-api"
+    else
+        echo "✗ cli_dispatch start cliproxy 别名传递失败: $res_start"
+        exit 1
+    fi
+
+    res_stop=$(cli_dispatch stop workbuddy 2>&1 || true)
+    if echo "$res_stop" | grep -q "docker_called:stop workbuddy2api"; then
+        echo "✓ cli_dispatch stop workbuddy 正确转换为 workbuddy2api"
+    else
+        echo "✗ cli_dispatch stop workbuddy 别名传递失败: $res_stop"
+        exit 1
+    fi
+
+    res_logs=$(cli_dispatch logs newapi 2>&1 || true)
+    if echo "$res_logs" | grep -q "new-api"; then
+        echo "✓ cli_dispatch logs newapi 正确识别 new-api"
+    else
+        echo "✗ cli_dispatch logs newapi 别名传递失败: $res_logs"
+        exit 1
+    fi
+)
+echo "✓ Test 26 通过"
+
+# Test 27: install_docker service name integrity (H-4)
+echo "[Test 27] 校验 install_docker 服务启停脚本完整性 (docker 无字符截断)..."
+if grep -q 'systemctl enable --now docke$' aiproxy.sh; then
+    echo "✗ aiproxy.sh 中存在截断的 docke 服务名"
+    exit 1
+else
+    echo "✓ aiproxy.sh 中 docker 服务名完整无截断"
+fi
+echo "✓ Test 27 通过"
+
+# Test 28: menu_uninstall variable integrity (M-4)
+echo "[Test 28] 校验 menu_uninstall 变量命名完整性 (rm_dir 无字符截断)..."
+if grep -q 'read -r -p .* rm_di$' aiproxy.sh; then
+    echo "✗ menu_uninstall 中存在截断的 rm_di 变量名"
+    exit 1
+else
+    echo "✓ menu_uninstall 中 rm_dir 变量名完整匹配"
+fi
+echo "✓ Test 28 通过"
+
+# Test 29: generate_random_base64 local variable scoping (H-2)
+echo "[Test 29] 校验 generate_random_base64 局部变量作用域 (hex_str 无截断)..."
+if grep -q 'local hex_st$' aiproxy.sh; then
+    echo "✗ generate_random_base64 中存在截断的 local hex_st"
+    exit 1
+else
+    echo "✓ generate_random_base64 中 local hex_str 声明正确"
+fi
+echo "✓ Test 29 通过"
+
+# Test 30: main_menu closed stdin EOF handling (C-2)
+echo "[Test 30] 测试 main_menu 输入流 EOF 优雅退出（防止管道无限死循环）(C-2)..."
+(
+    cd test_env
+    cp ../aiproxy.sh .
+    export CACHED_HOST_IP="127.0.0.1"
+    out=$(bash aiproxy.sh menu < /dev/null 2>&1 || true)
+    if echo "$out" | grep -q "检测到输入流已关闭 (EOF)"; then
+        echo "✓ 成功检测到 EOF 并安全退出，未发生死循环"
+    else
+        echo "✗ EOF 退出处理异常: $out"
+        exit 1
+    fi
+)
+echo "✓ Test 30 通过"
+
 # Clean test_env
 rm -rf test_env
 
 echo "=========================================="
-echo "🎉 全部 24 项自动化深度测试（含架构修复、密码学、SELinux 与系统可靠性）全部通过！"
+echo "🎉 全部 30 项自动化深度测试（含架构修复、密码学、SELinux 与系统可靠性）全部通过！"
 echo "=========================================="

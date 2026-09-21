@@ -107,7 +107,7 @@ install_docker() {
 
     # 启动并配置自启
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl enable --now docke
+        systemctl enable --now docker
     elif command -v rc-service >/dev/null 2>&1; then
         rc-update add docker boot 2>/dev/null || true
         rc-service docker start
@@ -130,7 +130,10 @@ get_ram_info() {
     local total_mb=0 free_mb=0
     if [ -f /proc/meminfo ]; then
         total_mb=$(awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo)
-        free_mb=$(awk '/MemAvailable/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || awk '/MemFree/ {print int($2 / 1024)}' /proc/meminfo)
+        free_mb=$(awk '/MemAvailable/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null)
+        if [ -z "$free_mb" ]; then
+            free_mb=$(awk '/MemFree/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null)
+        fi
     elif command -v free >/dev/null 2>&1; then
         total_mb=$(free -m | awk '/Mem:/ {print $2}')
         free_mb=$(free -m | awk '/Mem:/ {print $4}')
@@ -286,7 +289,7 @@ generate_random_base64() {
     elif command -v python >/dev/null 2>&1; then
         python -c "import os,base64; print(base64.b64encode(os.urandom($num_bytes)).decode())" 2>/dev/null
     else
-        local hex_st
+        local hex_str
         hex_str=$(generate_random_hex "$num_bytes")
         if command -v xxd >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
             printf "%s" "$hex_str" | xxd -r -p 2>/dev/null | base64 | tr -d '\r\n'
@@ -628,15 +631,11 @@ print_header() {
             elif [ -n "$state_val" ]; then
                 run_str="${RED}■ 已停止${RESET}"
             else
-                if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qw "$cname"; then
-                    run_str="${RED}■ 已停止${RESET}"
-                else
-                    run_str="${YELLOW}○ 未运行${RESET}"
-                fi
+                run_str="${YELLOW}○ 未运行${RESET}"
             fi
         fi
 
-        printf " %-16s %-18b %-20b %-20s %-20s\n" "$label" "$inst_str" "$run_str" "$bind_str" "$res_str"
+        printf " %-16s %-18b %-20b %-20s %-20b\n" "$label" "$inst_str" "$run_str" "$bind_str" "$res_str"
     done
     echo -e "${CYAN}======================================================================${RESET}"
 }
@@ -1121,18 +1120,13 @@ create_swap() {
     swapon "$swap_file"
 
     # 持久化到 /etc/fstab，强制包含 nofail 容灾标记并在写入前备份 (C-4)
-    if [ -f /etc/fstab ]; then
-        if ! grep -q "$swap_file" /etc/fstab 2>/dev/null; then
-            cp /etc/fstab "/etc/fstab.bak_$(date +%s)" 2>/dev/null || true
-            echo "$swap_file swap swap defaults,nofail 0 0" >> /etc/fstab
-            info "已将 Swap 配置持久化写入 /etc/fstab (包含 defaults,nofail 容灾保护)"
-        else
-            if ! grep -qE "$swap_file\s+swap\s+swap\s+[^[:space:]]*nofail" /etc/fstab 2>/dev/null; then
-                cp /etc/fstab "/etc/fstab.bak_$(date +%s)" 2>/dev/null || true
-                sed -i -E "s|($swap_file\s+swap\s+swap\s+defaults)|\1,nofail|" /etc/fstab 2>/dev/null || true
-                info "已自动为 /etc/fstab 中现有的 Swap 挂载配置追加 nofail 标记"
-            fi
-        fi
+    local fstab_file="${FSTAB_FILE:-/etc/fstab}"
+    if [ -f "$fstab_file" ]; then
+        cp "$fstab_file" "${fstab_file}.bak_$(date +%s)" 2>/dev/null || true
+        # 清理可能存在格式不一或缺少 nofail 的旧条目，确保单一规范配置
+        sed -i "\|$swap_file[[:space:]]|d" "$fstab_file" 2>/dev/null || true
+        echo "$swap_file swap swap defaults,nofail 0 0" >> "$fstab_file"
+        info "已将 Swap 配置持久化写入 $fstab_file (包含 defaults,nofail 容灾保护)"
     fi
 
     tune_swappiness
@@ -1160,19 +1154,13 @@ tune_swappiness() {
 
 delete_swap() {
     check_root
-    local swap_file="/swapfile"
+    local swap_file="${SWAP_FILE:-/swapfile}"
+    local fstab_file="${FSTAB_FILE:-/etc/fstab}"
+    local swaps_proc="${SWAPS_PROC:-/proc/swaps}"
     local fstab_cleaned=false
 
-    # 1. 优先清理 /etc/fstab 中残留的 Swap 配置，即使 swapfile 已被手动删除也能清理 (C-4)
-    if [ -f /etc/fstab ] && grep -q "$swap_file" /etc/fstab 2>/dev/null; then
-        cp /etc/fstab "/etc/fstab.bak_$(date +%s)" 2>/dev/null || true
-        sed -i "\|$swap_file[[:space:]]|d" /etc/fstab
-        fstab_cleaned=true
-        info "已从 /etc/fstab 清理 $swap_file 挂载配置。"
-    fi
-
-    # 2. 安全检查：如果当前系统 Swap 正在使用且超过可用物理内存，禁止执行 swapoff (C-3)
-    if [ -f /proc/swaps ] && grep -q "$swap_file" /proc/swaps 2>/dev/null; then
+    # 1. 安全检查：如果当前系统 Swap 正在使用且超过可用物理内存，禁止执行 swapoff 并保持系统配置不变 (C-3)
+    if [ -f "$swaps_proc" ] && grep -q "$swap_file" "$swaps_proc" 2>/dev/null; then
         local st=0 sf=0 rt=0 rf=0
         read -r rt rf <<< "$(get_ram_info)"
         read -r st sf <<< "$(get_swap_info)"
@@ -1184,16 +1172,24 @@ delete_swap() {
         fi
     fi
 
+    # 2. 仅在安全校验通过后，清理 /etc/fstab 中残留的 Swap 配置 (C-4)
+    if [ -f "$fstab_file" ] && grep -q "$swap_file" "$fstab_file" 2>/dev/null; then
+        cp "$fstab_file" "${fstab_file}.bak_$(date +%s)" 2>/dev/null || true
+        sed -i "\|$swap_file[[:space:]]|d" "$fstab_file"
+        fstab_cleaned=true
+        info "已从 $fstab_file 清理 $swap_file 挂载配置。"
+    fi
+
     # 3. 卸载与删除文件
-    if [ -f "$swap_file" ] || ([ -f /proc/swaps ] && grep -q "$swap_file" /proc/swaps 2>/dev/null); then
+    if [ -f "$swap_file" ] || ([ -f "$swaps_proc" ] && grep -q "$swap_file" "$swaps_proc" 2>/dev/null); then
         info "正在卸载并删除 $swap_file..."
         swapoff "$swap_file" 2>/dev/null || true
         rm -f "$swap_file"
         success "Swap 虚拟内存已完全移除！"
     elif [ "$fstab_cleaned" = true ]; then
-        success "已清理 /etc/fstab 中残留的 Swap 配置！"
+        success "已清理 $fstab_file 中残留的 Swap 配置！"
     else
-        warn "未检测到 $swap_file 且 /etc/fstab 无相关记录，无需清理！"
+        warn "未检测到 $swap_file 且 $fstab_file 无相关记录，无需清理！"
     fi
 }
 
@@ -1431,7 +1427,7 @@ workbuddy.${domain} {
 ${caddy_blocks}
 ${end_tag}"
 
-            if grep -qF "$start_tag" /etc/caddy/Caddyfile 2>/dev/null; then
+            if grep -qF "$start_tag" /etc/caddy/Caddyfile 2>/dev/null && grep -qF "$end_tag" /etc/caddy/Caddyfile 2>/dev/null; then
                 # 清除已有标记块以防止重复生成
                 sed -i "\|$start_tag|,\|$end_tag|d" /etc/caddy/Caddyfile
             fi
@@ -1550,14 +1546,14 @@ menu_uninstall() {
     success "aiproxy-box 容器与快捷方式卸载完成！"
 
     if [ -d "$APP_DIR" ]; then
-        read -r -p "是否清理项目主程序目录 ($APP_DIR)？(y/N): " rm_di
+        read -r -p "是否清理项目主程序目录 ($APP_DIR)？(y/N): " rm_dir
         if [[ "$rm_dir" =~ ^[Yy]$ ]]; then
             if [[ "$rm_data" =~ ^[Yy]$ ]]; then
                 info "正在清理 $APP_DIR ..."
                 ( sleep 1 && rm -rf "$APP_DIR" ) >/dev/null 2>&1 &
             else
                 info "保留 $DATA_DIR，正在清理其余程序与模板文件..."
-                find "$APP_DIR" -maxdepth 1 ! -name "data" ! -name "." ! -name ".." -exec rm -rf {} + 2>/dev/null || true
+                ( sleep 1 && find "$APP_DIR" -maxdepth 1 ! -name "data" ! -name "." ! -name ".." -exec rm -rf {} + ) >/dev/null 2>&1 &
                 info "数据目录已完好保留在: $DATA_DIR"
             fi
         fi
@@ -1574,7 +1570,7 @@ main_menu() {
     while true; do
         # 捕获 Ctrl+C 防止意外退出主循环，在每次循环迭代重新生效 (M-5)
         trap 'echo ""; echo -e "\n${GREEN}[INFO] 如需退出 aiproxy 控制台，请输入 0 回车。${RESET}"' INT
-        print_heade
+        print_header
         echo -e " ${BOLD}核心功能操作:${RESET}"
         echo -e "  ${GREEN}1.${RESET} 服务启停与重启管理       ${GREEN}7.${RESET} NewAPI 渠道配置指引与连通性测试"
         echo -e "  ${GREEN}2.${RESET} 组件配置与加装定制       ${GREEN}8.${RESET} 反向代理助手 (Caddyfile 生成)"
@@ -1588,14 +1584,10 @@ main_menu() {
 
         local choice=""
         if ! read -r -p " 请输入操作选项 [0-12]: " choice; then
-            # 捕获输入流 EOF，防止在管道调用时死循环刷屏 (C-2)
-            if [ -e /dev/tty ] && [ -r /dev/tty ]; then
-                exec < /dev/tty
-            else
-                echo ""
-                warn "检测到输入流已关闭 (EOF)，自动退出 aiproxy 控制台。"
-                exit 0
-            fi
+            # 捕获输入流 EOF，防止在管道调用或非交互环境时死循环刷屏 (C-2)
+            echo ""
+            warn "检测到输入流已关闭 (EOF)，自动退出 aiproxy 控制台。"
+            exit 0
         fi
 
         case "$choice" in
@@ -1638,7 +1630,7 @@ cli_dispatch() {
             success "项目环境与 Compose 编排文件初始化完成！"
             ;;
         status)
-            print_heade
+            print_header
             ;;
         start)
             if [ -n "$2" ]; then

@@ -128,14 +128,14 @@ aiproxy
 
 ## 🔑 核心组件默认凭据一览
 
-首次部署启动后，各组件初始凭据如下（建议生产环境及时修改）：
+首次部署启动后，系统会自动为各个组件动态生成高强度随机密钥（存储于各配置文件中，防止静态暴露）：
 
-| 服务组件 | 访问入口 | 默认账号 / 密钥 | 配置文件路径 |
+| 服务组件 | 访问入口 | 初始账号 / 密钥机制 | 配置文件路径 |
 | :--- | :--- | :--- | :--- |
 | **NewAPI** | `http://IP:3000` | 初始管理员: `root` / 初始密码: `123456` | `data/newapi/api.db` |
-| **Grok2API** | `http://IP:8000` | `admin` / `grok2api_default_password` (自动生成 32 字节 AES 密钥) | `data/grok2api/config.yaml` |
-| **CLIProxyAPI** | `http://IP:8317` | 调用 Key: `sk-cliproxy-default-key`<br>管理后台 Key: `aiproxy-cliproxy-admin` | `data/cliproxy/config.yaml` |
-| **WorkBuddy2API** | `http://IP:7863` | 调用 Key: `sk-workbuddy-default-key` | `data/workbuddy/config.json` |
+| **Grok2API** | `http://IP:8000` | `admin` / 随机生成密码 (自动注入 32 字节 AES-256 密钥) | `data/grok2api/config.yaml` |
+| **CLIProxyAPI** | `http://IP:8317` | 调用 Key: 随机动态生成 (`sk-cliproxy-...`)<br>管理后台 Key: 随机动态生成 | `data/cliproxy/config.yaml` |
+| **WorkBuddy2API** | `http://IP:7863` | 调用 Key: 随机动态生成 (`sk-workbuddy-...`) | `data/workbuddy/config.json` |
 
 ---
 
@@ -147,14 +147,14 @@ aiproxy
 - **渠道类型**：`OpenAI`
 - **渠道名称**：`Grok2API-内网集群`
 - **代理地址 (Base URL)**：`http://grok2api:8000` *(如果跨机器部署填 `http://宿主机IP:8000`)*
-- **密钥 (API Key)**：在 `data/grok2api/config.yaml` 或管理控制台配置的 Key（默认可通过后台免密或自定义配置）
+- **密钥 (API Key)**：在 `data/grok2api/config.yaml` 或管理控制台配置的 Key（可在后台配置或直接在渠道填入自定义 Token）
 - **推荐模型**：`grok-3`, `grok-3-deepsearch`, `grok-3-reasoning`, `grok-2`, `grok-2-imageGen`
 
 ### 2. CLIProxyAPI (Claude / Codex / GrokBuild)
 - **渠道类型**：`OpenAI` 或 `Anthropic` (根据绑定的凭据类型选择)
 - **渠道名称**：`CLIProxyAPI-网关`
 - **代理地址 (Base URL)**：`http://cli-proxy-api:8317`
-- **密钥 (API Key)**：`data/cliproxy/config.yaml` 中设置的 Key（预设为 `sk-cliproxy-default-key`）
+- **密钥 (API Key)**：`data/cliproxy/config.yaml` 中由安装引擎动态生成的 API Key（可通过菜单 7 一键查看）
 - **推荐模型**：`claude-3-7-sonnet`, `claude-3-5-sonnet`, `gpt-4o`, `o1`, `gemini-2.5-pro`
 - **凭据管理后台**：访问 `http://服务器IP:8317/management.html`
 
@@ -162,7 +162,7 @@ aiproxy
 - **渠道类型**：`OpenAI`
 - **渠道名称**：`WorkBuddy2API-节点`
 - **代理地址 (Base URL)**：`http://workbuddy2api:7863`
-- **密钥 (API Key)**：`data/workbuddy/config.json` 中的 `api_key`（预设为 `sk-workbuddy-default-key`）
+- **密钥 (API Key)**：`data/workbuddy/config.json` 中由安装引擎动态生成的 `api_key`（可通过菜单 7 一键查看）
 - **推荐模型**：`gemini-2.5-pro`, `gemini-2.5-flash`, `claude-3-7-sonnet`, `claude-3-5-sonnet`
 
 > 💡 **连通性校验**：进入菜单选项 `[7]`，选择 `1. 执行内网与宿主连通性实时测试`，脚本将自动在 `new-api` 容器内发起探测并返回 HTTP 状态码。

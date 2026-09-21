@@ -107,7 +107,10 @@ install_docker() {
 
     # 启动并配置自启
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl enable --now docker
+        systemctl enable --now docke
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-update add docker boot 2>/dev/null || true
+        rc-service docker start
     elif command -v service >/dev/null 2>&1; then
         service docker start
     fi
@@ -149,10 +152,9 @@ get_swap_info() {
 
 CACHED_HOST_IP=""
 
-get_host_ip() {
+ensure_host_ip() {
     if [ -n "$CACHED_HOST_IP" ]; then
-        echo "$CACHED_HOST_IP"
-        return
+        return 0
     fi
     local ip
     ip=$(curl -s -m 1 https://ip.sb 2>/dev/null || \
@@ -160,6 +162,10 @@ get_host_ip() {
          curl -s -m 1 https://api.ipify.org 2>/dev/null || \
          hostname -I 2>/dev/null | awk '{print $1}')
     CACHED_HOST_IP="${ip:-127.0.0.1}"
+}
+
+get_host_ip() {
+    ensure_host_ip
     echo "$CACHED_HOST_IP"
 }
 
@@ -217,12 +223,34 @@ WORKBUDDY_PORT=${WORKBUDDY_PORT:-7863}
 # 系统时区
 TZ=${TZ:-Asia/Shanghai}
 EOF
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
 }
 
 is_service_enabled() {
     local svc="$1"
     local list="${2:-$ENABLED_SERVICES}"
     [[ ",${list}," =~ ,${svc}, ]]
+}
+
+normalize_service_name() {
+    local name="$1"
+    case "$name" in
+        newapi|new-api|new_api)
+            echo "new-api"
+            ;;
+        grok|grok2|grok2api|grok-api)
+            echo "grok2api"
+            ;;
+        cliproxy|cli-proxy|cli-proxy-api|cliproxyapi)
+            echo "cli-proxy-api"
+            ;;
+        workbuddy|workbuddy2|workbuddy2api|workbuddy-api)
+            echo "workbuddy2api"
+            ;;
+        *)
+            echo "$name"
+            ;;
+    esac
 }
 
 # ------------------------------------------------------------------------------
@@ -232,10 +260,18 @@ generate_random_hex() {
     local num_bytes="${1:-32}"
     if command -v openssl >/dev/null 2>&1; then
         openssl rand -hex "$num_bytes" 2>/dev/null | tr -d '\r\n'
-    elif [ -c /dev/urandom ]; then
-        head -c "$num_bytes" /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \r\n' || head -c "$((num_bytes * 2))" /dev/urandom | tr -dc 'a-f0-9'
+    elif [ -c /dev/urandom ] && command -v od >/dev/null 2>&1; then
+        head -c "$num_bytes" /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \r\n'
+    elif [ -c /dev/urandom ] && command -v hexdump >/dev/null 2>&1; then
+        hexdump -vn "$num_bytes" -e '/1 "%02x"' /dev/urandom 2>/dev/null | tr -d '\r\n'
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "import secrets; print(secrets.token_hex($num_bytes))" 2>/dev/null
+    elif command -v python >/dev/null 2>&1; then
+        python -c "import os,binascii; print(binascii.hexlify(os.urandom($num_bytes)).decode())" 2>/dev/null
     else
-        date +%s%N | sha256sum | awk '{print $1}' | head -c "$((num_bytes * 2))"
+        local entropy
+        entropy=$( (date +%s%N 2>/dev/null || date +%s); echo "$$ $RANDOM $(uname -a 2>/dev/null)" )
+        printf "%s" "$entropy" | sha256sum 2>/dev/null | awk '{print $1}' | head -c "$((num_bytes * 2))"
     fi
 }
 
@@ -243,10 +279,22 @@ generate_random_base64() {
     local num_bytes="${1:-32}"
     if command -v openssl >/dev/null 2>&1; then
         openssl rand -base64 "$num_bytes" 2>/dev/null | tr -d '\r\n'
-    elif [ -c /dev/urandom ]; then
+    elif [ -c /dev/urandom ] && command -v base64 >/dev/null 2>&1; then
         head -c "$num_bytes" /dev/urandom 2>/dev/null | base64 | tr -d '\r\n'
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "import os,base64; print(base64.b64encode(os.urandom($num_bytes)).decode())" 2>/dev/null
+    elif command -v python >/dev/null 2>&1; then
+        python -c "import os,base64; print(base64.b64encode(os.urandom($num_bytes)).decode())" 2>/dev/null
     else
-        date +%s%N | base64 | tr -d '\r\n' | head -c 44
+        local hex_st
+        hex_str=$(generate_random_hex "$num_bytes")
+        if command -v xxd >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+            printf "%s" "$hex_str" | xxd -r -p 2>/dev/null | base64 | tr -d '\r\n'
+        elif command -v perl >/dev/null 2>&1; then
+            perl -e 'use MIME::Base64; print encode_base64(pack("H*", "'"$hex_str"'"), "");' 2>/dev/null
+        else
+            head -c "$num_bytes" /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '\r\n'
+        fi
     fi
 }
 
@@ -257,43 +305,58 @@ init_service_configs() {
     mkdir -p "$DATA_DIR/workbuddy/auths"
     mkdir -p "$DATA_DIR/workbuddy/data"
 
-    # 1. Grok2API 初始配置
+    # 1. Grok2API 初始配置与随机凭据注入 (AES-256 / 32字节，管理员随机密码)
     if [ ! -f "$DATA_DIR/grok2api/config.yaml" ] && [ -f "$TEMPLATES_DIR/grok2api.yaml" ]; then
         info "初始化 Grok2API 默认配置文件并注入随机加密密钥 (AES-256 / 32字节)..."
-        local jwt_secret enc_key
+        local jwt_secret enc_key admin_pass
         jwt_secret=$(generate_random_hex 32)
         enc_key=$(generate_random_base64 32)
+        admin_pass=$(generate_random_hex 16)
         sed -e "s#CHANGE_ME_JWT_SECRET_32_HEX_CHARACTERS#$jwt_secret#g" \
             -e "s#CHANGE_ME_BASE64_ENCRYPTION_KEY_32_BYTES#$enc_key#g" \
+            -e "s#CHANGE_ME_GROK2API_ADMIN_PASSWORD#$admin_pass#g" \
+            -e "s#grok2api_default_password#$admin_pass#g" \
             "$TEMPLATES_DIR/grok2api.yaml" > "$DATA_DIR/grok2api/config.yaml"
     fi
 
-    # 2. CLIProxyAPI 初始配置
+    # 2. CLIProxyAPI 初始配置与动态随机 Key 生成
     if [ ! -f "$DATA_DIR/cliproxy/config.yaml" ] && [ -f "$TEMPLATES_DIR/cliproxy.yaml" ]; then
-        info "初始化 CLIProxyAPI 默认配置文件..."
-        cp "$TEMPLATES_DIR/cliproxy.yaml" "$DATA_DIR/cliproxy/config.yaml"
+        info "初始化 CLIProxyAPI 默认配置文件并注入随机 API 密钥与管理密钥..."
+        local cliproxy_key cliproxy_secret
+        cliproxy_key="sk-cliproxy-$(generate_random_hex 16)"
+        cliproxy_secret="cliproxy-admin-$(generate_random_hex 16)"
+        sed -e "s#CHANGE_ME_CLIPROXY_API_KEY#$cliproxy_key#g" \
+            -e "s#sk-cliproxy-default-key#$cliproxy_key#g" \
+            -e "s#CHANGE_ME_CLIPROXY_SECRET_KEY#$cliproxy_secret#g" \
+            -e "s#aiproxy-cliproxy-admin#$cliproxy_secret#g" \
+            "$TEMPLATES_DIR/cliproxy.yaml" > "$DATA_DIR/cliproxy/config.yaml"
     fi
 
-    # 3. WorkBuddy2API 初始配置与 UID 权限修复
+    # 3. WorkBuddy2API 初始配置与动态随机 Key 生成
     if [ ! -f "$DATA_DIR/workbuddy/config.json" ] && [ -f "$TEMPLATES_DIR/workbuddy.json" ]; then
-        info "初始化 WorkBuddy2API 默认配置文件..."
-        cp "$TEMPLATES_DIR/workbuddy.json" "$DATA_DIR/workbuddy/config.json"
+        info "初始化 WorkBuddy2API 默认配置文件并注入随机 API 密钥..."
+        local workbuddy_key
+        workbuddy_key="sk-workbuddy-$(generate_random_hex 16)"
+        sed -e "s#CHANGE_ME_WORKBUDDY_API_KEY#$workbuddy_key#g" \
+            -e "s#sk-workbuddy-default-key#$workbuddy_key#g" \
+            "$TEMPLATES_DIR/workbuddy.json" > "$DATA_DIR/workbuddy/config.json"
     fi
 
-    # 设置目录权限，防止 umask 导致容器内部权限拒绝
-    chmod 755 "$DATA_DIR/newapi" 2>/dev/null || true
-    chmod 755 "$DATA_DIR/grok2api" "$DATA_DIR/grok2api/data" 2>/dev/null || true
-    [ -f "$DATA_DIR/grok2api/config.yaml" ] && chmod 644 "$DATA_DIR/grok2api/config.yaml" 2>/dev/null || true
-    [ -f "$DATA_DIR/cliproxy/config.yaml" ] && chmod 644 "$DATA_DIR/cliproxy/config.yaml" 2>/dev/null || true
+    # 设置严格最小权限，防止敏感凭据被低权限非特权用户读取 (H-1)
+    chmod 750 "$DATA_DIR/newapi" 2>/dev/null || true
+    chmod 750 "$DATA_DIR/grok2api" "$DATA_DIR/grok2api/data" 2>/dev/null || true
+    chmod 750 "$DATA_DIR/cliproxy" "$DATA_DIR/cliproxy/auths" 2>/dev/null || true
+    [ -f "$DATA_DIR/grok2api/config.yaml" ] && chmod 600 "$DATA_DIR/grok2api/config.yaml" 2>/dev/null || true
+    [ -f "$DATA_DIR/cliproxy/config.yaml" ] && chmod 600 "$DATA_DIR/cliproxy/config.yaml" 2>/dev/null || true
 
-    # 修复 WorkBuddy2API 的 uid 10001 读写权限问题 (跨 uid 部署经典踩坑点)
+    # 修复 WorkBuddy2API 的 uid 10001 读写权限与目录安全防护 (替代 777)
     if [ -d "$DATA_DIR/workbuddy" ]; then
-        chmod 755 "$DATA_DIR/workbuddy" 2>/dev/null || true
-        [ -f "$DATA_DIR/workbuddy/config.json" ] && chmod 644 "$DATA_DIR/workbuddy/config.json" 2>/dev/null || true
+        chmod 750 "$DATA_DIR/workbuddy" 2>/dev/null || true
+        [ -f "$DATA_DIR/workbuddy/config.json" ] && chmod 600 "$DATA_DIR/workbuddy/config.json" 2>/dev/null || true
         if [ "$(id -u)" -eq 0 ]; then
             chown -R 10001:10001 "$DATA_DIR/workbuddy" 2>/dev/null || true
         fi
-        chmod -R 777 "$DATA_DIR/workbuddy/auths" "$DATA_DIR/workbuddy/data" 2>/dev/null || true
+        chmod 750 "$DATA_DIR/workbuddy/auths" "$DATA_DIR/workbuddy/data" 2>/dev/null || true
     fi
 }
 
@@ -347,7 +410,7 @@ EOF
     ports:
       - "\${BIND_IP:-127.0.0.1}:\${NEWAPI_PORT:-3000}:3000"
     volumes:
-      - ./data/newapi:/data
+      - ./data/newapi:/data:z
     environment:
       - TZ=\${TZ:-Asia/Shanghai}
     networks:
@@ -378,8 +441,8 @@ EOF
     ports:
       - "\${BIND_IP:-127.0.0.1}:\${GROK2API_PORT:-8000}:8000"
     volumes:
-      - ./data/grok2api/config.yaml:/run/grok2api/config.yaml:ro
-      - ./data/grok2api/data:/app/data
+      - ./data/grok2api/config.yaml:/run/grok2api/config.yaml:ro,z
+      - ./data/grok2api/data:/app/data:z
     environment:
       - TZ=\${TZ:-Asia/Shanghai}
     networks:
@@ -410,8 +473,8 @@ EOF
     ports:
       - "\${BIND_IP:-127.0.0.1}:\${CLIPROXY_PORT:-8317}:8317"
     volumes:
-      - ./data/cliproxy/config.yaml:/CLIProxyAPI/config.yaml
-      - ./data/cliproxy/auths:/root/.cli-proxy-api
+      - ./data/cliproxy/config.yaml:/CLIProxyAPI/config.yaml:z
+      - ./data/cliproxy/auths:/root/.cli-proxy-api:z
     environment:
       - TZ=\${TZ:-Asia/Shanghai}
     networks:
@@ -442,9 +505,9 @@ EOF
     ports:
       - "\${BIND_IP:-127.0.0.1}:\${WORKBUDDY_PORT:-7863}:7863"
     volumes:
-      - ./data/workbuddy/auths:/app/auths
-      - ./data/workbuddy/data:/app/data
-      - ./data/workbuddy/config.json:/app/config.json:ro
+      - ./data/workbuddy/auths:/app/auths:z
+      - ./data/workbuddy/data:/app/data:z
+      - ./data/workbuddy/config.json:/app/config.json:ro,z
     environment:
       - TZ=\${TZ:-Asia/Shanghai}
     networks:
@@ -465,6 +528,7 @@ EOF
         fi
     fi
 
+    chmod 600 "$COMPOSE_FILE" 2>/dev/null || true
     success "Compose 文件已成功构建！"
 }
 
@@ -512,8 +576,8 @@ print_header() {
     clear 2>/dev/null || echo ""
     read -r ram_total ram_free <<< "$(get_ram_info)"
     read -r swap_total swap_free <<< "$(get_swap_info)"
-    local host_ip
-    host_ip=$(get_host_ip)
+    ensure_host_ip
+    local host_ip="$CACHED_HOST_IP"
 
     echo -e "${CYAN}======================================================================${RESET}"
     echo -e "${BOLD}${CYAN}        __ _ _ __  _ __ _____  ___   _      _                      ${RESET}"
@@ -538,6 +602,11 @@ print_header() {
 
     local svcs=("newapi:NewAPI:new-api:$NEWAPI_PORT" "grok2api:Grok2API:grok2api:$GROK2API_PORT" "cliproxy:CLIProxyAPI:cli-proxy-api:$CLIPROXY_PORT" "workbuddy:WorkBuddy2API:workbuddy2api:$WORKBUDDY_PORT")
 
+    # 批量单次采集所有容器的状态与资源占用，消除串行轮询假死 (M-1)
+    local ps_batch stats_batch
+    ps_batch=$(docker ps -a --format '{{.Names}}={{.State}}' 2>/dev/null || true)
+    stats_batch=$(docker stats --no-stream --format '{{.Name}}={{.CPUPerc}} | {{.MemUsage}}' 2>/dev/null || true)
+
     for item in "${svcs[@]}"; do
         IFS=':' read -r code label cname port <<< "$item"
         local inst_str="${DIM}未安装${RESET}"
@@ -548,15 +617,22 @@ print_header() {
         if is_service_enabled "$code"; then
             inst_str="${GREEN}已启用${RESET}"
             bind_str="${BIND_IP}:${port}"
-            local st
-            st=$(get_container_status "$cname")
-            if [ "$st" = "运行中" ]; then
+
+            local state_val
+            state_val=$(echo "$ps_batch" | awk -F'=' -v cn="$cname" '$1==cn {print $2}')
+            if [ "$state_val" = "running" ]; then
                 run_str="${GREEN}● 运行中${RESET}"
-                res_str=$(get_container_stats "$cname")
-            elif [ "$st" = "已停止" ]; then
+                local stat_val
+                stat_val=$(echo "$stats_batch" | awk -F'=' -v cn="$cname" '$1==cn {print $2}')
+                res_str="${stat_val:-0.00% | 0MB}"
+            elif [ -n "$state_val" ]; then
                 run_str="${RED}■ 已停止${RESET}"
             else
-                run_str="${YELLOW}○ 未运行${RESET}"
+                if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qw "$cname"; then
+                    run_str="${RED}■ 已停止${RESET}"
+                else
+                    run_str="${YELLOW}○ 未运行${RESET}"
+                fi
             fi
         fi
 
@@ -607,6 +683,7 @@ menu_service_control() {
             4)
                 echo -e "可选容器: new-api, grok2api, cli-proxy-api, workbuddy2api"
                 read -r -p "请输入要启动的容器名称: " cname
+                cname=$(normalize_service_name "$cname")
                 if [ -n "$cname" ]; then
                     (docker start "$cname" 2>/dev/null || compose up -d "$cname") && success "$cname 已启动" || error "启动失败"
                 fi
@@ -615,6 +692,7 @@ menu_service_control() {
             5)
                 echo -e "可选容器: new-api, grok2api, cli-proxy-api, workbuddy2api"
                 read -r -p "请输入要重启的容器名称: " cname
+                cname=$(normalize_service_name "$cname")
                 if [ -n "$cname" ]; then
                     (docker restart "$cname" 2>/dev/null || (compose stop "$cname" 2>/dev/null && compose up -d "$cname")) && success "$cname 已重启" || error "重启失败"
                 fi
@@ -623,6 +701,7 @@ menu_service_control() {
             6)
                 echo -e "可选容器: new-api, grok2api, cli-proxy-api, workbuddy2api"
                 read -r -p "请输入要停止的容器名称: " cname
+                cname=$(normalize_service_name "$cname")
                 if [ -n "$cname" ]; then
                     docker stop "$cname" && success "$cname 已停止" || error "停止失败"
                 fi
@@ -899,18 +978,18 @@ menu_network_mode() {
 
             # 校验宿主机端口占用
             local warn_msg=""
-            if ! check_host_port_conflict "$np1" "new-api"; then
-                [ $? -eq 2 ] && warn_msg="NewAPI 端口 $np1"
-            fi
-            if ! check_host_port_conflict "$np2" "grok2api"; then
-                [ $? -eq 2 ] && warn_msg="${warn_msg:+$warn_msg, }Grok2API 端口 $np2"
-            fi
-            if ! check_host_port_conflict "$np3" "cli-proxy-api"; then
-                [ $? -eq 2 ] && warn_msg="${warn_msg:+$warn_msg, }CLIProxy 端口 $np3"
-            fi
-            if ! check_host_port_conflict "$np4" "workbuddy2api"; then
-                [ $? -eq 2 ] && warn_msg="${warn_msg:+$warn_msg, }WorkBuddy 端口 $np4"
-            fi
+            local ret=0
+            ret=0; check_host_port_conflict "$np1" "new-api" || ret=$?
+            [ "$ret" -eq 2 ] && warn_msg="NewAPI 端口 $np1"
+
+            ret=0; check_host_port_conflict "$np2" "grok2api" || ret=$?
+            [ "$ret" -eq 2 ] && warn_msg="${warn_msg:+$warn_msg, }Grok2API 端口 $np2"
+
+            ret=0; check_host_port_conflict "$np3" "cli-proxy-api" || ret=$?
+            [ "$ret" -eq 2 ] && warn_msg="${warn_msg:+$warn_msg, }CLIProxy 端口 $np3"
+
+            ret=0; check_host_port_conflict "$np4" "workbuddy2api" || ret=$?
+            [ "$ret" -eq 2 ] && warn_msg="${warn_msg:+$warn_msg, }WorkBuddy 端口 $np4"
 
             if [ -n "$warn_msg" ]; then
                 warn "检测到宿主机外部进程可能已占用: ${warn_msg}！"
@@ -1006,6 +1085,19 @@ create_swap() {
     info "准备创建 ${size_mb}MB Swap 虚拟内存..."
     local swap_file="/swapfile"
 
+    # 安全检查：如果当前系统 Swap 正在使用且超过可用物理内存，禁止执行 swapoff (C-3)
+    if [ -f /proc/swaps ] && grep -q "$swap_file" /proc/swaps 2>/dev/null; then
+        local st=0 sf=0 rt=0 rf=0
+        read -r rt rf <<< "$(get_ram_info)"
+        read -r st sf <<< "$(get_swap_info)"
+        local su=$(( st - sf ))
+        if [ "$su" -gt 0 ] && [ "$su" -ge "$rf" ]; then
+            error "安全拦截：当前已使用 Swap (${su}MB) 大于或接近系统可用物理内存 (${rf}MB)！"
+            error "此时执行 swapoff 将引发系统内核 OOM 宕机。请先停止高内存占用的容器或服务。"
+            return 1
+        fi
+    fi
+
     if [ -f "$swap_file" ]; then
         warn "检测到系统中已存在 $swap_file，正在先卸载并清理..."
         swapoff "$swap_file" 2>/dev/null || true
@@ -1016,20 +1108,31 @@ create_swap() {
     touch "$swap_file" 2>/dev/null || true
     chattr +C "$swap_file" 2>/dev/null || true
 
-    # 尝试使用 fallocate，失败则降级为 dd
+    # 尝试使用 fallocate，失败则降级为 dd，兼容无 status=progress 的环境 (H-4)
     info "分配磁盘空间 (${size_mb}MB)..."
     if ! fallocate -l "${size_mb}M" "$swap_file" 2>/dev/null; then
-        dd if=/dev/zero of="$swap_file" bs=1M count="$size_mb" status=progress
+        if ! dd if=/dev/zero of="$swap_file" bs=1M count="$size_mb" status=progress 2>/dev/null; then
+            dd if=/dev/zero of="$swap_file" bs=1M count="$size_mb"
+        fi
     fi
 
     chmod 600 "$swap_file"
     mkswap "$swap_file"
     swapon "$swap_file"
 
-    # 持久化到 /etc/fstab
-    if ! grep -q "$swap_file" /etc/fstab 2>/dev/null; then
-        echo "$swap_file swap swap defaults 0 0" >> /etc/fstab
-        info "已将 Swap 配置持久化写入 /etc/fstab"
+    # 持久化到 /etc/fstab，强制包含 nofail 容灾标记并在写入前备份 (C-4)
+    if [ -f /etc/fstab ]; then
+        if ! grep -q "$swap_file" /etc/fstab 2>/dev/null; then
+            cp /etc/fstab "/etc/fstab.bak_$(date +%s)" 2>/dev/null || true
+            echo "$swap_file swap swap defaults,nofail 0 0" >> /etc/fstab
+            info "已将 Swap 配置持久化写入 /etc/fstab (包含 defaults,nofail 容灾保护)"
+        else
+            if ! grep -qE "$swap_file\s+swap\s+swap\s+[^[:space:]]*nofail" /etc/fstab 2>/dev/null; then
+                cp /etc/fstab "/etc/fstab.bak_$(date +%s)" 2>/dev/null || true
+                sed -i -E "s|($swap_file\s+swap\s+swap\s+defaults)|\1,nofail|" /etc/fstab 2>/dev/null || true
+                info "已自动为 /etc/fstab 中现有的 Swap 挂载配置追加 nofail 标记"
+            fi
+        fi
     fi
 
     tune_swappiness
@@ -1058,17 +1161,40 @@ tune_swappiness() {
 delete_swap() {
     check_root
     local swap_file="/swapfile"
-    if [ ! -f "$swap_file" ]; then
-        warn "未检测到 $swap_file，无需清理！"
-        return
+    local fstab_cleaned=false
+
+    # 1. 优先清理 /etc/fstab 中残留的 Swap 配置，即使 swapfile 已被手动删除也能清理 (C-4)
+    if [ -f /etc/fstab ] && grep -q "$swap_file" /etc/fstab 2>/dev/null; then
+        cp /etc/fstab "/etc/fstab.bak_$(date +%s)" 2>/dev/null || true
+        sed -i "\|$swap_file[[:space:]]|d" /etc/fstab
+        fstab_cleaned=true
+        info "已从 /etc/fstab 清理 $swap_file 挂载配置。"
     fi
-    info "正在卸载并删除 $swap_file..."
-    swapoff "$swap_file" 2>/dev/null || true
-    rm -f "$swap_file"
-    if [ -f /etc/fstab ]; then
-        sed -i '\|/swapfile[[:space:]]|d' /etc/fstab
+
+    # 2. 安全检查：如果当前系统 Swap 正在使用且超过可用物理内存，禁止执行 swapoff (C-3)
+    if [ -f /proc/swaps ] && grep -q "$swap_file" /proc/swaps 2>/dev/null; then
+        local st=0 sf=0 rt=0 rf=0
+        read -r rt rf <<< "$(get_ram_info)"
+        read -r st sf <<< "$(get_swap_info)"
+        local su=$(( st - sf ))
+        if [ "$su" -gt 0 ] && [ "$su" -ge "$rf" ]; then
+            error "安全拦截：当前已使用 Swap (${su}MB) 大于或接近系统可用物理内存 (${rf}MB)！"
+            error "此时执行 swapoff 将引发系统内核 OOM 宕机。请先停止高内存占用的容器或服务。"
+            return 1
+        fi
     fi
-    success "Swap 虚拟内存已完全移除！"
+
+    # 3. 卸载与删除文件
+    if [ -f "$swap_file" ] || ([ -f /proc/swaps ] && grep -q "$swap_file" /proc/swaps 2>/dev/null); then
+        info "正在卸载并删除 $swap_file..."
+        swapoff "$swap_file" 2>/dev/null || true
+        rm -f "$swap_file"
+        success "Swap 虚拟内存已完全移除！"
+    elif [ "$fstab_cleaned" = true ]; then
+        success "已清理 /etc/fstab 中残留的 Swap 配置！"
+    else
+        warn "未检测到 $swap_file 且 /etc/fstab 无相关记录，无需清理！"
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -1077,8 +1203,8 @@ delete_swap() {
 menu_channel_guide() {
     clear 2>/dev/null || echo ""
     load_env
-    local host_ip
-    host_ip=$(get_host_ip)
+    ensure_host_ip
+    local host_ip="$CACHED_HOST_IP"
 
     echo -e "${CYAN}================== [7] NewAPI 渠道配置卡片与内网连通指引 ==================${RESET}"
     echo -e " 当同时部署 NewAPI 与各后端服务时，优先推荐使用 ${GREEN}Docker 内网别名直连${RESET}："
@@ -1089,8 +1215,8 @@ menu_channel_guide() {
 
     # 读取各服务配置中的密钥
     local grok_key="请在管理后台查看"
-    local cliproxy_key="sk-cliproxy-default-key"
-    local workbuddy_key="sk-workbuddy-default-key"
+    local cliproxy_key="动态生成 (在 config.yaml 中查看)"
+    local workbuddy_key="动态生成 (在 config.json 中查看)"
 
     if [ -f "$DATA_DIR/cliproxy/config.yaml" ]; then
         local found_key
@@ -1293,14 +1419,31 @@ workbuddy.${domain} {
     echo -e "${MAGENTA}----------------------------------------------------------------------${RESET}"
 
     if [ "$has_caddy" = true ] && [ -f /etc/caddy/Caddyfile ]; then
-        read -r -p "是否直接将上述配置追加到 /etc/caddy/Caddyfile 并重载 Caddy? (y/N): " append_choice
+        read -r -p "是否直接将上述配置写入 /etc/caddy/Caddyfile 并重载 Caddy? (y/N): " append_choice
         if [[ "$append_choice" =~ ^[Yy]$ ]]; then
-            cat <<EOF >> /etc/caddy/Caddyfile
+            local bak_file="/etc/caddy/Caddyfile.bak_$(date '+%Y%m%d_%H%M%S')"
+            cp /etc/caddy/Caddyfile "$bak_file" 2>/dev/null || true
+            info "已备份现有 Caddyfile 到 $bak_file"
 
-# === aiproxy-box auto reverse proxy block ===
-$caddy_blocks
-EOF
-            caddy reload --config /etc/caddy/Caddyfile 2>/dev/null && success "已追加配置并重载 Caddy！" || warn "配置已追加，但重载可能需要手动执行: caddy reload"
+            local start_tag="# === aiproxy-box auto reverse proxy block start ==="
+            local end_tag="# === aiproxy-box auto reverse proxy block end ==="
+            local new_block="${start_tag}
+${caddy_blocks}
+${end_tag}"
+
+            if grep -qF "$start_tag" /etc/caddy/Caddyfile 2>/dev/null; then
+                # 清除已有标记块以防止重复生成
+                sed -i "\|$start_tag|,\|$end_tag|d" /etc/caddy/Caddyfile
+            fi
+            echo "$new_block" >> /etc/caddy/Caddyfile
+
+            if caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
+                caddy reload --config /etc/caddy/Caddyfile 2>/dev/null && success "已更新配置并平滑重载 Caddy！" || warn "配置已写入，但重载需要手动执行: caddy reload"
+            else
+                warn "检测到 Caddy 语法校验未通过，正在自动回滚..."
+                cp "$bak_file" /etc/caddy/Caddyfile 2>/dev/null || true
+                error "配置写入已回滚，请检查域名或已有 site block 冲突！"
+            fi
         fi
     fi
     pause
@@ -1330,9 +1473,9 @@ menu_backup() {
     local backup_name="aiproxy-box-backup-$(date '+%Y%m%d_%H%M%S').tar.gz"
     info "正在打包凭证、数据库与配置文件到: $backup_name ..."
 
-    # 检查待备份的关键项是否存在，防止 tar 报错
+    # 检查待备份的关键项是否存在，包含脚本与核心模版配置 (H-3)
     local items=()
-    for f in data .env templates docker-compose.yml; do
+    for f in data .env templates docker-compose.yml aiproxy.sh install.sh; do
         [ -e "$APP_DIR/$f" ] && items+=("$f")
     done
 
@@ -1350,9 +1493,10 @@ menu_backup() {
         "${items[@]}" 2>/dev/null
 
     if [ -f "$APP_DIR/$backup_name" ]; then
+        chmod 600 "$APP_DIR/$backup_name" 2>/dev/null || true
         local bsize
         bsize=$(du -h "$APP_DIR/$backup_name" | awk '{print $1}')
-        success "备份成功！文件保存于: ${BOLD}${APP_DIR}/${backup_name}${RESET} (大小: ${bsize})"
+        success "备份成功！文件保存于: ${BOLD}${APP_DIR}/${backup_name}${RESET} (大小: ${bsize}, 权限: 600)"
         echo -e "提示: 迁移服务器时，只需将该备份包解压至新服务器 /opt/aiproxy-box 即可无缝恢复。"
     else
         error "打包失败，请检查磁盘空间！"
@@ -1393,23 +1537,32 @@ menu_uninstall() {
     info "正在停止并清理容器..."
     compose down -v --remove-orphans 2>/dev/null || true
 
+    local rm_data="n"
     read -r -p "是否同时彻底删除所有凭证与持久化数据 (data/ 目录)？(y/N): " rm_data
     if [[ "$rm_data" =~ ^[Yy]$ ]]; then
         rm -rf "$DATA_DIR" "$ENV_FILE" "$COMPOSE_FILE"
         info "运行时数据已清空。"
+    else
+        info "已保留持久化凭据与数据目录: $DATA_DIR"
     fi
 
     rm -f "/usr/local/bin/aiproxy"
     success "aiproxy-box 容器与快捷方式卸载完成！"
 
-    if [ "$APP_DIR" = "/opt/aiproxy-box" ]; then
-        read -r -p "是否同时删除项目安装目录 ($APP_DIR)？(y/N): " rm_dir
+    if [ -d "$APP_DIR" ]; then
+        read -r -p "是否清理项目主程序目录 ($APP_DIR)？(y/N): " rm_di
         if [[ "$rm_dir" =~ ^[Yy]$ ]]; then
-            info "正在清理 $APP_DIR ..."
-            rm -rf "$APP_DIR"
+            if [[ "$rm_data" =~ ^[Yy]$ ]]; then
+                info "正在清理 $APP_DIR ..."
+                ( sleep 1 && rm -rf "$APP_DIR" ) >/dev/null 2>&1 &
+            else
+                info "保留 $DATA_DIR，正在清理其余程序与模板文件..."
+                find "$APP_DIR" -maxdepth 1 ! -name "data" ! -name "." ! -name ".." -exec rm -rf {} + 2>/dev/null || true
+                info "数据目录已完好保留在: $DATA_DIR"
+            fi
         fi
     fi
-    pause
+    success "卸载操作已结束。"
     exit 0
 }
 
@@ -1418,10 +1571,10 @@ menu_uninstall() {
 # ------------------------------------------------------------------------------
 main_menu() {
     ensure_initialized
-    # 捕获 Ctrl+C 防止意外退出主循环
-    trap 'echo ""; echo -e "\n${GREEN}[INFO] 如需退出 aiproxy 控制台，请输入 0 回车。${RESET}"' INT
     while true; do
-        print_header
+        # 捕获 Ctrl+C 防止意外退出主循环，在每次循环迭代重新生效 (M-5)
+        trap 'echo ""; echo -e "\n${GREEN}[INFO] 如需退出 aiproxy 控制台，请输入 0 回车。${RESET}"' INT
+        print_heade
         echo -e " ${BOLD}核心功能操作:${RESET}"
         echo -e "  ${GREEN}1.${RESET} 服务启停与重启管理       ${GREEN}7.${RESET} NewAPI 渠道配置指引与连通性测试"
         echo -e "  ${GREEN}2.${RESET} 组件配置与加装定制       ${GREEN}8.${RESET} 反向代理助手 (Caddyfile 生成)"
@@ -1432,7 +1585,19 @@ main_menu() {
         echo -e " ----------------------------------------------------------------------"
         echo -e "  ${WHITE}0.${RESET} 退出管理菜单"
         echo -e "${CYAN}======================================================================${RESET}"
-        read -r -p " 请输入操作选项 [0-12]: " choice
+
+        local choice=""
+        if ! read -r -p " 请输入操作选项 [0-12]: " choice; then
+            # 捕获输入流 EOF，防止在管道调用时死循环刷屏 (C-2)
+            if [ -e /dev/tty ] && [ -r /dev/tty ]; then
+                exec < /dev/tty
+            else
+                echo ""
+                warn "检测到输入流已关闭 (EOF)，自动退出 aiproxy 控制台。"
+                exit 0
+            fi
+        fi
+
         case "$choice" in
             1) menu_service_control ;;
             2) menu_component_selection ;;
@@ -1473,11 +1638,13 @@ cli_dispatch() {
             success "项目环境与 Compose 编排文件初始化完成！"
             ;;
         status)
-            print_header
+            print_heade
             ;;
         start)
             if [ -n "$2" ]; then
-                docker start "$2" 2>/dev/null || compose up -d "$2"
+                local target
+                target=$(normalize_service_name "$2")
+                docker start "$target" 2>/dev/null || compose up -d "$target"
             else
                 generate_compose
                 compose up -d
@@ -1485,14 +1652,18 @@ cli_dispatch() {
             ;;
         stop)
             if [ -n "$2" ]; then
-                docker stop "$2"
+                local target
+                target=$(normalize_service_name "$2")
+                docker stop "$target"
             else
                 compose down
             fi
             ;;
         restart)
             if [ -n "$2" ]; then
-                docker restart "$2" 2>/dev/null || (compose stop "$2" && compose up -d "$2")
+                local target
+                target=$(normalize_service_name "$2")
+                docker restart "$target" 2>/dev/null || (compose stop "$target" && compose up -d "$target")
             else
                 generate_compose
                 compose restart
@@ -1500,7 +1671,9 @@ cli_dispatch() {
             ;;
         logs)
             if [ -n "$2" ]; then
-                compose logs -f --tail=100 "$2"
+                local target
+                target=$(normalize_service_name "$2")
+                compose logs -f --tail=100 "$target"
             else
                 compose logs -f --tail=50
             fi

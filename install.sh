@@ -12,6 +12,7 @@ RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
+WHITE="\033[37m"
 BOLD="\033[1m"
 RESET="\033[0m"
 
@@ -68,6 +69,9 @@ if [ "$has_docker" = false ] || [ "$has_compose" = false ]; then
     }
     if command -v systemctl >/dev/null 2>&1; then
         systemctl enable --now docker >/dev/null 2>&1 || true
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-update add docker boot >/dev/null 2>&1 || true
+        rc-service docker start >/dev/null 2>&1 || true
     fi
 fi
 echo -e "${GREEN}✓ Docker 及 Docker Compose 准备就绪！${RESET}"
@@ -117,7 +121,21 @@ echo -e "全局快捷命令: ${BOLD}${YELLOW}aiproxy${RESET} (随时随地直接
 echo -e "项目部署目录: ${BOLD}${WHITE}${INSTALL_DIR}${RESET}"
 echo -e "${GREEN}======================================================================${RESET}"
 echo ""
-read -r -p "是否立即启动 aiproxy 交互控制台？(Y/n): " launch_now
+launch_now="n"
+if [ -t 0 ]; then
+    read -r -p "是否立即启动 aiproxy 交互控制台？(Y/n): " launch_now || launch_now="n"
+elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
+    read -r -p "是否立即启动 aiproxy 交互控制台？(Y/n): " launch_now < /dev/tty 2>/dev/null || launch_now="n"
+else
+    echo -e "${YELLOW}[INFO] 检测到非交互式终端环境 (如管道或自动化脚本)，已跳过自动启动控制台。${RESET}"
+    echo -e "您可以随时在终端运行 ${BOLD}${YELLOW}aiproxy${RESET} 开启控制台。"
+    exit 0
+fi
+
 if [[ ! "$launch_now" =~ ^[Nn]$ ]]; then
-    exec /usr/local/bin/aiproxy
+    if [ -t 0 ]; then
+        exec /usr/local/bin/aiproxy
+    elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
+        exec /usr/local/bin/aiproxy < /dev/tty
+    fi
 fi

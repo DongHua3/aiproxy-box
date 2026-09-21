@@ -22,7 +22,7 @@ secrets:
 
 bootstrapAdmin:
   username: "admin"
-  password: "grok2api_default_password"
+  password: "CHANGE_ME_GROK2API_ADMIN_PASSWORD"
 
 frontend:
   staticPath: "./frontend/dist"
